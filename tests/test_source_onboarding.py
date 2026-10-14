@@ -257,16 +257,19 @@ class SourcePlanTests(SourceFixture):
                             statement="approved", includes=(), allow_review=(), branch="main")
 
     def test_plan_excludes_review_items_until_explicitly_promoted(self):
-        project = self.make_git_project(extra_files={"release/bundle.zip": b"PK\x03\x04data"})
-        self.commit_all(project)
+        project = self.root / "plain-review"
+        (project / "src").mkdir(parents=True)
+        (project / "src" / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (project / "release").mkdir()
+        (project / "release" / "bundle.zip").write_bytes(b"PK\x03\x04data")
         remote = self.make_remote()
-        self.plan(project, remote)
+        self.plan(project, remote, branch="main")
         manifest = (self.work / ach.SOURCE_MANIFEST_FILE).read_text(encoding="utf-8")
         self.assertNotIn("release/bundle.zip", manifest)
 
         fresh = self.root / "work2"
         fresh.mkdir()
-        self.plan(project, remote, work=fresh, allow_review=("release/*",))
+        self.plan(project, remote, work=fresh, allow_review=("release/*",), branch="main")
         self.assertIn("release/bundle.zip",
                       (fresh / ach.SOURCE_MANIFEST_FILE).read_text(encoding="utf-8"))
 
@@ -315,13 +318,15 @@ class SourcePublishTests(SourceFixture):
         self.assertEqual([], self.remote_files(remote))
 
     def test_publish_refuses_when_the_commit_contains_unapproved_files(self):
-        project = self.make_git_project(extra_files={"release/bundle.zip": b"PK\x03\x04data"})
+        project = self.make_git_project()
         self.commit_all(project)
         remote = self.make_remote()
         digest = self.plan(project, remote)
+        (project / "unapproved.py").write_text("SHOULD_NOT_UPLOAD = True\n", encoding="utf-8")
+        self.commit_all(project, "unapproved change after planning")
         with self.assertRaises(ach.HubError) as caught:
             ach.source_publish(self.work, approve_manifest=digest, message="x")
-        self.assertIn("release/bundle.zip", str(caught.exception))
+        self.assertIn("History changed after approval", str(caught.exception))
         self.assertEqual([], self.remote_files(remote))
 
     def test_publish_refuses_an_existing_different_origin(self):
@@ -441,7 +446,7 @@ class SourcePublishTests(SourceFixture):
         digest = self.plan(project, remote, branch="release")
         with self.assertRaises(ach.HubError) as caught:
             ach.source_publish(self.work, approve_manifest=digest, message="x")
-        self.assertIn("does not exist locally", str(caught.exception))
+        self.assertIn("currently on 'main'", str(caught.exception))
 
     def test_owner_declared_deny_patterns_exclude_files_from_the_manifest(self):
         # A Git-tracked path is necessarily in history, so --deny can only act on files
@@ -602,7 +607,8 @@ class SourceAccessTests(SourceFixture):
         self.assertIn("VERDICT: sharing NOT VERIFIED", summary)
 
         ach.source_access(self.work, tool="codex", status="verified",
-                          evidence="independently cloned the repository and read src/main.py")
+                          evidence="independently cloned the repository and read src/main.py",
+                          sha=self.remote_head(remote))
         summary = ach.render_access_summary(self.work)
         self.assertIn("VERDICT: sharing VERIFIED with codex", summary)
 
@@ -614,6 +620,17 @@ class SourceAccessTests(SourceFixture):
         self.plan(project, self.make_remote())
         with self.assertRaises(ach.HubError):
             ach.source_access(self.work, tool="chatgpt", status="maybe", evidence="nope")
+
+    def test_verified_access_requires_the_exact_published_commit(self):
+        project = self.make_git_project()
+        self.commit_all(project)
+        remote = self.make_remote()
+        digest = self.plan(project, remote)
+        ach.source_publish(self.work, approve_manifest=digest, message="Initial upload")
+        with self.assertRaises(ach.HubError):
+            ach.source_access(self.work, tool="codex", status="verified",
+                              evidence="synthetic read", sha="0" * 40)
+        self.assertFalse((self.work / ach.SOURCE_ACCESS_FILE).exists())
 
 
 if __name__ == "__main__":
