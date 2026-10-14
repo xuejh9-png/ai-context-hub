@@ -33,10 +33,10 @@ Git acts as the concurrency and audit layer. Per-agent unique handoff file names
 - Code correctness source of truth: the target application's actual source repo, runtime checks and test evidence.
 - Previous shared cloud storage: archival/transition source until all consumers confirm the Git remote; not two simultaneous writable authorities.
 
-## Version roadmap
+## Verified deployment versus roadmap
 
-- v0.1: project templates, read/handoff/validate, Git sync, local 2-agent concurrency tests.
-- v0.2: actual multi-tool read/write tests with user-connected GitHub remote; review workflow for decision edits.
-- v1.0: stable onboarding across projects, provider-independent packaging and documented failure modes.
+- **Current v0.1:** project templates, read/handoff/validate, Git sync, failure recovery and two-agent concurrency tests. In one authorized real-world pilot, WorkBuddy and Codex independently submitted private-repository handoffs; ChatGPT independently read back both records with a GitHub connector. This verifies an **on-demand artifact-sharing workflow**, not complete chat mirroring or universal read/write access across every platform.
+- **Next:** smooth human-triggered handoff creation, consistent onboarding instructions for each agent, reviewed edits to mutable decision/status documents, and measurement of actual time saved and failure rates.
+- **Longer term (only if justified):** provider-neutral packaging and better retrieval across growing project archives.
 
 Do not add an always-on server, relational DB, vector DB, embedding API, or agents without evidence that simple Git artifacts fail on real workload.
