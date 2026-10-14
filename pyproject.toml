@@ -1,7 +1,7 @@
 [project]
 name = "ai-context-hub"
-version = "0.1.0"
-description = "On-demand Git-backed project context sharing across AI tools"
+version = "0.3.0"
+description = "On-demand Git-backed project context, task packets, UAT feedback and private source onboarding"
 requires-python = ">=3.10"
 
 [project.scripts]
