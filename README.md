@@ -173,7 +173,8 @@ python .../ach.py source-plan \
     --workdir ~/source-onboarding/some-project \
     --mode snapshot --deny 'artifacts/*' \
     --authorize "<you>" --statement "Approved: first upload of the reviewed file list"
-# -> prints the digest of the exact file list in SOURCE_MANIFEST.txt
+# -> prints one approval digest binding destination, mode, planned HEAD and the exact
+#    file list in SOURCE_MANIFEST.txt
 #    --mode snapshot publishes ONE commit with only these files and never uploads the
 #    project's own history; --mode history (default) publishes the existing commits
 
@@ -187,14 +188,20 @@ python .../ach.py source-verify --workdir ~/source-onboarding/some-project
 # 5. Record what each OTHER tool can actually do — never infer it
 python .../ach.py source-access --workdir ~/source-onboarding/some-project \
     --tool chatgpt --status pending --evidence "connector not yet pointed at the repo"
+# A verified record must include the exact Commit SHA from SOURCE_RESULT.md:
+python .../ach.py source-access --workdir ~/source-onboarding/some-project \
+    --tool codex --status verified --sha <exact-published-commit> \
+    --evidence "independently cloned and read the published commit"
 ```
 
 Hard gates: denied file types (`.env`, keys, keystores, databases), credential patterns, and
-denied paths **anywhere in the project's Git history** refuse the plan outright; archives,
-backups and oversized files are excluded until explicitly promoted; a `github.com`
-destination that is readable without authentication is refused as public; an existing
-different `origin` is a hard refusal; divergence stops the upload instead of forcing; and the
-pushed tree must equal the approved manifest byte for byte.
+denied paths or contents **anywhere in the project's Git history** refuse history mode outright;
+archives, backups and oversized historical blobs also require snapshot mode. A `github.com`
+destination is accepted only when the unauthenticated API returns exactly `404` and authenticated
+Git access succeeds; ambiguous API failures are refused. An existing different `origin` is a hard
+refusal; history mode must still be on the approved branch and HEAD; unrelated history stops
+snapshot publication instead of forcing; and the immutable commit tree must equal the approved
+manifest byte for byte before push.
 
 `source-verify` proves only that **this machine** can push and read back. Until a second tool
 records a verified read with `source-access`, the summary reports

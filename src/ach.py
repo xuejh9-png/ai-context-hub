@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fnmatch
+import functools
 import glob
 import hashlib
 import os
@@ -111,7 +112,8 @@ def one_line(value: str, name: str) -> str:
 
 def safe_rel(rel: str) -> bool:
     """Reject absolute, empty, '.' and '..' path components (path traversal guard)."""
-    if not rel or rel.startswith("/") or re.match(r"^[A-Za-z]:[/\\]", rel):
+    if (not rel or rel.startswith("/") or re.match(r"^[A-Za-z]:[/\\]", rel)
+            or any(ord(char) < 32 for char in rel)):
         return False
     return not any(part in ("", ".", "..") for part in rel.split("/"))
 
@@ -1492,18 +1494,19 @@ def render_index(root: Path, slug: str) -> str:
 
 SOURCE_PLAN_FILE = "SOURCE_PLAN.md"
 SOURCE_MANIFEST_FILE = "SOURCE_MANIFEST.txt"
+SOURCE_PENDING_FILE = "SOURCE_PENDING.md"
 SOURCE_RESULT_FILE = "SOURCE_RESULT.md"
 SOURCE_VERIFY_FILE = "SOURCE_VERIFY.md"
 SOURCE_ACCESS_FILE = "SOURCE_ACCESS.md"
 MAX_SOURCE_FILE = 5_000_000
 MAX_SOURCE_TOTAL = 200_000_000
 MAX_SOURCE_FILES = 5_000
-SOURCE_SCAN_BYTES = 262_144
-SOURCE_SCAN_FILES = 2_000
+SOURCE_SCAN_BYTES = MAX_SOURCE_FILE
+SOURCE_SCAN_FILES = MAX_SOURCE_FILES
 SOURCE_WORK_FILES = (SOURCE_PLAN_FILE, SOURCE_MANIFEST_FILE, SOURCE_RESULT_FILE,
-                     SOURCE_VERIFY_FILE, SOURCE_ACCESS_FILE)
+                     SOURCE_VERIFY_FILE, SOURCE_ACCESS_FILE, SOURCE_PENDING_FILE)
 SOURCE_MODES = ("history", "snapshot")
-SOURCE_SNAPSHOT_REF = "refs/ach/snapshot/"
+SOURCE_SNAPSHOT_MARKER = "AI-Context-Hub-Snapshot: v1"
 SOURCE_TOOL_STATUS = ("verified", "pending", "blocked")
 DEFAULT_SOURCE_IGNORE = frozenset((
     ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules", "__pycache__",
@@ -1544,6 +1547,8 @@ def source_project_path(value: str) -> Path:
 def require_external_workdir(project: Path, workdir: Path) -> Path:
     """The work directory must exist and must not live inside the inspected project."""
     project = project.expanduser().resolve()
+    if any(ord(char) < 32 for char in str(project)):
+        fail("The local project path contains control characters and cannot be recorded safely.")
     workdir = workdir.expanduser().resolve()
     if not workdir.is_dir():
         fail(f"Work directory not found: {workdir}. Create it first; this tool will not create it.")
@@ -1572,11 +1577,13 @@ def source_deny_reason(rel: str, path: Path, scan_budget: list[int]) -> str | No
     if size <= SOURCE_SCAN_BYTES and scan_budget[0] > 0:
         scan_budget[0] -= 1
         try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            return None
+            text = path.read_bytes().decode("latin-1")
+        except OSError:
+            return "unreadable file"
         if secret_hit(text):
             return "credential pattern detected inside the file"
+    elif size <= SOURCE_SCAN_BYTES:
+        return "credential scan limit exceeded"
     return None
 
 
@@ -1695,32 +1702,104 @@ def select_source_files(project: Path, includes: tuple[str, ...],
                      "policy": policy, "candidates": candidates}
 
 
+def git_blob_bytes(project: Path, object_ids: list[str]) -> dict[str, bytes]:
+    """Read Git blobs in one binary-safe batch without checking them out."""
+    unique = list(dict.fromkeys(object_ids))
+    if not unique:
+        return {}
+    process = subprocess.run(
+        ["git", "-C", str(project), "cat-file", "--batch"],
+        input=("\n".join(unique) + "\n").encode("ascii"), capture_output=True, check=False,
+    )
+    if process.returncode:
+        fail("Could not inspect historical Git blobs safely; use snapshot mode instead.")
+    output = process.stdout
+    position = 0
+    blobs: dict[str, bytes] = {}
+    for requested in unique:
+        end = output.find(b"\n", position)
+        if end < 0:
+            fail("Git returned a malformed blob inspection response; use snapshot mode instead.")
+        header = output[position:end].decode("ascii", errors="replace")
+        position = end + 1
+        fields = header.split()
+        if len(fields) != 3 or fields[1] != "blob" or not fields[2].isdigit():
+            fail("Git could not provide a historical blob for inspection; use snapshot mode instead.")
+        size = int(fields[2])
+        data = output[position:position + size]
+        position += size
+        if len(data) != size or position >= len(output) or output[position:position + 1] != b"\n":
+            fail("Git returned a truncated blob inspection response; use snapshot mode instead.")
+        position += 1
+        blobs[requested] = data
+    return blobs
+
+
 def source_history_findings(project: Path, deny: tuple[str, ...] = ()) -> list[tuple[str, str]]:
-    """Any denied path that ever entered the project's Git history would be uploaded too."""
+    """Find paths or historical blob contents that history mode would disclose."""
     if not (project / ".git").is_dir():
         return []
     listing = run_git(project, "log", "--all", "--pretty=format:", "--name-only",
                       "-z", check=False)
-    if listing.returncode:
-        return []
+    objects = run_git(project, "rev-list", "--objects", "--all", check=False)
+    if listing.returncode or objects.returncode:
+        return [("(history scan)", "Git history could not be inspected completely")]
+
     seen: dict[str, str] = {}
-    scan_budget = [SOURCE_SCAN_FILES]
     for rel in {item for item in listing.stdout.split("\0") if item}:
-        if not safe_rel(rel) or rel in seen:
+        if not safe_rel(rel):
             continue
-        path = project / rel
-        if path.is_file():
-            reason = source_deny_reason(rel, path, scan_budget)
-        else:
-            reason = None
-            name = Path(rel).name.lower()
-            if (name.startswith(".env") and name != ".env.example") or name in SOURCE_DENY_NAMES \
-                    or Path(rel).suffix.lower() in SOURCE_DENY_SUFFIX:
-                reason = "denied file type present in Git history"
-        if reason is None and any(fnmatch.fnmatch(rel, pattern) for pattern in deny):
-            reason = "owner-declared policy pattern present in Git history"
-        if reason:
-            seen[rel] = reason
+        name = Path(rel).name.lower()
+        suffix = Path(rel).suffix.lower()
+        if ((name.startswith(".env") and name != ".env.example")
+                or name in SOURCE_DENY_NAMES or suffix in SOURCE_DENY_SUFFIX):
+            seen[rel] = "denied file type present in Git history"
+        elif suffix in SOURCE_REVIEW_SUFFIX:
+            seen[rel] = ("archive/backup/dump file type present in Git history; its historical "
+                         "versions cannot be individually approved")
+        elif any(fnmatch.fnmatch(rel, pattern) for pattern in deny):
+            seen[rel] = "owner-declared policy pattern present in Git history"
+
+    object_paths: dict[str, str] = {}
+    for line in objects.stdout.splitlines():
+        object_id, separator, rel = line.partition(" ")
+        if separator and safe_rel(rel):
+            object_paths.setdefault(object_id, rel)
+    if not object_paths:
+        return sorted(seen.items())
+
+    check = subprocess.run(
+        ["git", "-C", str(project), "cat-file",
+         "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+        input=("\n".join(object_paths) + "\n"), text=True, encoding="utf-8",
+        errors="replace", capture_output=True, check=False,
+    )
+    if check.returncode:
+        return sorted({**seen, "(history scan)":
+                       "historical Git objects could not be inspected completely"}.items())
+    scan_ids: list[str] = []
+    scanned_bytes = 0
+    for line in check.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or fields[1] != "blob" or not fields[2].isdigit():
+            continue
+        object_id, size = fields[0], int(fields[2])
+        rel = object_paths.get(object_id, "(historical blob)")
+        if size > MAX_SOURCE_FILE:
+            seen.setdefault(rel, f"historical blob exceeds the per-file limit ({human_bytes(size)})")
+            continue
+        scanned_bytes += size
+        if len(scan_ids) >= SOURCE_SCAN_FILES or scanned_bytes > MAX_SOURCE_TOTAL:
+            seen["(history scan)"] = ("historical content exceeds the complete credential-scan "
+                                      "limit; use snapshot mode")
+            break
+        scan_ids.append(object_id)
+    else:
+        blobs = git_blob_bytes(project, scan_ids)
+        for object_id, data in blobs.items():
+            if secret_hit(data.decode("latin-1")):
+                seen.setdefault(object_paths.get(object_id, "(historical blob)"),
+                                "credential pattern detected inside a historical blob")
     return sorted(seen.items())
 
 
@@ -1861,7 +1940,7 @@ def default_api_probe(slug: str) -> int:
 def check_destination(url: str, api_probe=None, remote_probe=None) -> tuple[str, str]:
     """Return (kind, detail) where kind is local | private | refused."""
     value = url.strip()
-    if not value or "\n" in value:
+    if not value or "\n" in value or "\r" in value:
         fail("--dest must be one non-empty line.")
     if destination_is_local(value):
         path = Path(value.removeprefix("file://")).expanduser()
@@ -1879,13 +1958,25 @@ def check_destination(url: str, api_probe=None, remote_probe=None) -> tuple[str,
     if status == 200:
         return "refused", (f"{slug} is readable without authentication, so it is PUBLIC. Refusing: "
                            "application source must live in a private repository.")
+    if status != 404:
+        return "refused", (f"cannot prove {slug} is private because the unauthenticated GitHub "
+                           f"visibility check returned HTTP {status or 'unavailable'}. Refusing to "
+                           "treat an API error or rate limit as privacy evidence; retry when the "
+                           "visibility check is available.")
     reachable = remote_probe(value) if remote_probe else git_remote_reachable(value)
     if not reachable[0]:
         return "refused", (f"{slug} is not publicly readable (good) but Git access also failed, so it "
                            "does not exist yet or this machine lacks credentials. Create the PRIVATE "
                            "repository and grant this machine access, then rerun. "
                            f"git said: {reachable[1]}")
-    return "private", f"{slug}: not publicly readable via the API and readable via Git — verified private"
+    return "private", (f"{slug}: unauthenticated API returned 404 and authenticated Git access "
+                       "succeeded — verified private")
+
+
+def require_publish_destination(url: str) -> None:
+    kind, detail = check_destination(url)
+    if kind == "refused":
+        fail("Destination privacy/access recheck failed immediately before publication: " + detail)
 
 
 def git_remote_reachable(url: str) -> tuple[bool, str]:
@@ -1901,6 +1992,18 @@ def manifest_body(entries: list[tuple[str, int, str]]) -> str:
     return "\n".join(f"{digest}  {size}  {rel}" for rel, size, digest in entries) + "\n"
 
 
+def source_approval_digest(*, slug: str, project: str, destination: str, branch: str,
+                           mode: str, planned_head: str, authorized_by: str,
+                           statement: str, manifest: str) -> str:
+    """Bind publication controls and file bytes into one owner-approved digest."""
+    envelope = ("ai-context-hub-source-approval-v1\n"
+                f"project-slug={slug}\nlocal-project-path={project}\n"
+                f"destination={destination}\nbranch={branch}\nmode={mode}\n"
+                f"planned-head={planned_head}\nauthorized-by={authorized_by}\n"
+                f"authorization-statement={statement}\nmanifest:\n{manifest}")
+    return sha256_text(envelope)
+
+
 def build_manifest(project: Path, decided) -> tuple[str, str]:
     entries = []
     for rel, path, size in decided:
@@ -1909,13 +2012,88 @@ def build_manifest(project: Path, decided) -> tuple[str, str]:
     return body, sha256_text(body)
 
 
-def snapshot_commit(project: Path, entries, message: str, branch: str) -> str:
+def verify_commit_manifest(project: Path, sha: str, entries) -> None:
+    """Verify the immutable commit tree, including every approved byte, before push."""
+    tree = run_git(project, "ls-tree", "-r", "--full-tree", "-z", sha, check=False)
+    if tree.returncode:
+        fail(f"Could not inspect the candidate commit {sha}; nothing was pushed.")
+    actual: dict[str, tuple[str, str]] = {}
+    for item in (value for value in tree.stdout.split("\0") if value):
+        metadata, separator, rel = item.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or not safe_rel(rel):
+            fail("The candidate commit contains a path Git could not inspect safely; nothing was "
+                 "pushed.")
+        _mode, kind, object_id = fields
+        actual[rel] = (kind, object_id)
+
+    approved = {rel: (size, digest) for rel, size, digest in entries}
+    extra = sorted(set(actual) - set(approved))
+    absent = sorted(set(approved) - set(actual))
+    changed: list[str] = []
+    blob_ids = [actual[rel][1] for rel in approved
+                if rel in actual and actual[rel][0] == "blob"]
+    blobs = git_blob_bytes(project, blob_ids)
+    for rel, (size, digest) in approved.items():
+        if rel not in actual:
+            continue
+        kind, object_id = actual[rel]
+        data = blobs.get(object_id) if kind == "blob" else None
+        if data is None or len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+            changed.append(rel)
+    if extra or absent or changed:
+        detail = []
+        if extra:
+            detail.append(f"{len(extra)} extra: {', '.join(extra[:5])}")
+        if absent:
+            detail.append(f"{len(absent)} missing: {', '.join(absent[:5])}")
+        if changed:
+            detail.append(f"{len(changed)} byte-mismatched: {', '.join(changed[:5])}")
+        fail("Refusing to push: the candidate commit does not match the approved manifest ("
+             + "; ".join(detail) + "). Nothing was pushed; re-plan against the current files.")
+
+
+def remote_branch_sha(project: Path, destination: str, branch: str) -> str:
+    result = run_git(project, "ls-remote", "--heads", destination,
+                     f"refs/heads/{branch}", check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        fail("Could not read the destination branch immediately before publication; nothing was "
+             "pushed. Git said: " + (detail[-1] if detail else "no output"))
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == f"refs/heads/{branch}" \
+                and CODE_SHA.fullmatch(fields[0]):
+            return fields[0]
+    return ""
+
+
+def ensure_remote_commit(project: Path, destination: str, branch: str, sha: str) -> None:
+    if not sha or run_git(project, "cat-file", "-e", f"{sha}^{{commit}}",
+                          check=False).returncode == 0:
+        return
+    fetched = run_git(project, "fetch", "--no-tags", "--no-write-fetch-head", destination,
+                      f"refs/heads/{branch}", check=False)
+    if fetched.returncode or run_git(project, "cat-file", "-e", f"{sha}^{{commit}}",
+                                     check=False).returncode:
+        fail("Could not fetch the destination commit without changing local refs; nothing was "
+             "pushed.")
+
+
+def require_snapshot_lineage(project: Path, sha: str, remote_name: str, branch: str) -> None:
+    message = run_git(project, "show", "-s", "--format=%B", sha, check=False)
+    if message.returncode or SOURCE_SNAPSHOT_MARKER not in message.stdout.splitlines():
+        fail(f"Divergent remote: {remote_name}/{branch} is not an AI Context Hub snapshot chain. "
+             "Refusing to attach an unrelated history or force-push it; use an empty destination "
+             "branch or reconcile it deliberately.")
+
+
+def snapshot_commit(project: Path, entries, message: str, branch: str,
+                    parent: str = "") -> str:
     """Build a commit containing exactly the manifest, without touching the working tree.
 
-    A private index file is used, so the project's own index, branches, reflog and files are
-    never modified. Later snapshots chain onto the previous snapshot through a local ref, so
-    the destination receives a clean linear history of code-only commits that never contains
-    anything the project's own Git history holds.
+    A private index file is used, and the destination head is passed directly as the parent,
+    so the project's own index, branches, refs, reflog and files are never modified.
     """
     paths = [rel for rel, _size, _digest in entries]
     holder = Path(tempfile.mkdtemp(prefix="ach-snapshot-"))
@@ -1931,14 +2109,12 @@ def snapshot_commit(project: Path, entries, message: str, branch: str) -> str:
         shutil.rmtree(holder, ignore_errors=True)
     if not tree:
         fail("Could not build a tree for the approved manifest.")
-    reference = f"{SOURCE_SNAPSHOT_REF}{branch}"
-    previous = run_git(project, "rev-parse", "--verify", "--quiet", reference,
-                       check=False).stdout.strip()
-    args = ["commit-tree", tree, "-m", message] + (["-p", previous] if previous else [])
+    _ = branch  # kept in the signature for compatibility with callers and audit hooks
+    args = ["commit-tree", tree, "-m", message, "-m", SOURCE_SNAPSHOT_MARKER] \
+        + (["-p", parent] if parent else [])
     sha = run_git(project, *args).stdout.strip()
     if not CODE_SHA.fullmatch(sha):
         fail("Could not create the snapshot commit.")
-    run_git(project, "update-ref", reference, sha)
     return sha
 
 
@@ -1953,9 +2129,11 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
     if mode not in SOURCE_MODES:
         fail(f"--mode must be one of: {', '.join(SOURCE_MODES)}")
     workdir = require_external_workdir(project, workdir)
-    if (workdir / SOURCE_PLAN_FILE).exists():
-        fail(f"{SOURCE_PLAN_FILE} already exists in the work directory. Use a fresh directory for a "
-             "new plan, or run source-publish on the existing one.")
+    existing_work = [name for name in SOURCE_WORK_FILES if (workdir / name).exists()]
+    if existing_work:
+        fail(f"The work directory already contains source-onboarding evidence "
+             f"({', '.join(existing_work)}). Use a fresh directory for a new plan; existing "
+             "evidence is never overwritten.")
     if not branch.strip():
         branch = run_git(project, "branch", "--show-current", check=False).stdout.strip() \
             if (project / ".git").is_dir() else ""
@@ -1963,6 +2141,9 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
     branch = one_line(branch, "--branch")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,120}", branch):
         fail(f"Unsafe branch name: {branch}")
+    planned_head = run_git(project, "rev-parse", "HEAD", check=False).stdout.strip() \
+        if (project / ".git").is_dir() else ""
+    planned_head = planned_head or "-"
     kind, detail = check_destination(dest, api_probe, remote_probe)
     if kind == "refused":
         fail(f"Destination not usable: {detail}")
@@ -1999,12 +2180,15 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
     if not entries:
         fail("Refusing to plan: no files were selected for upload.")
 
-    body, digest = build_manifest(project, entries)
-    (workdir / SOURCE_MANIFEST_FILE).write_text(
-        "# AI Context Hub source manifest\n"
-        f"# project    : {slug}\n# local path : {project}\n# destination: {dest.strip()}\n"
-        f"# branch     : {branch}\n# digest     : {digest}\n"
-        "# one line per file: <sha256>  <bytes>  <relative path>\n" + body, encoding="utf-8")
+    body, file_list_digest = build_manifest(project, entries)
+    digest = source_approval_digest(
+        slug=slug, project=str(project), destination=dest.strip(), branch=branch, mode=mode,
+        planned_head=planned_head, authorized_by=authorize, statement=statement, manifest=body)
+    manifest = ("# AI Context Hub source manifest\n"
+                f"# project    : {slug}\n# local path : {project}\n"
+                f"# destination: {dest.strip()}\n# branch     : {branch}\n"
+                f"# file digest: {file_list_digest}\n# approval digest: {digest}\n"
+                "# one line per file: <sha256>  <bytes>  <relative path>\n" + body)
 
     init_note = "the project is not a Git repository, so the approved first upload will run " \
                 f"`git init -b {branch}` inside it (nothing is deleted or rewritten)" \
@@ -2022,6 +2206,7 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
         f"# Source onboarding plan — {slug}\n\n"
         f"- Project slug: {slug}\n- Local project path: {project}\n- Destination: {dest.strip()}\n"
         f"- Destination check: {detail}\n- Branch: {branch}\n- Mode: {mode}\n"
+        f"- Planned HEAD: {planned_head}\n"
         f"- Planned (UTC): {stamp()}\n"
         f"- Authorized by: {authorize}\n- Authorization statement: {statement}\n"
         f"- Files approved: {len(entries)}\n- Total bytes: {total} ({human_bytes(total)})\n"
@@ -2051,16 +2236,20 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
            or "- none") + "\n\n"
         "## Next step\n\n"
         f"`source-publish --workdir {workdir} --approve-manifest {digest}`\n\n"
-        "Approving the digest means you have reviewed the exact file list in "
-        f"{SOURCE_MANIFEST_FILE}.\n")
+        "Approving the digest means you have reviewed the destination, branch, mode, planned "
+        f"HEAD, authorization and exact file list in {SOURCE_MANIFEST_FILE}.\n")
+    check_secrets(manifest)
     check_secrets(plan)
     path = workdir / SOURCE_PLAN_FILE
+    manifest_path = workdir / SOURCE_MANIFEST_FILE
+    with manifest_path.open("x", encoding="utf-8") as handle:
+        handle.write(manifest)
     with path.open("x", encoding="utf-8") as handle:
         handle.write(plan)
     print(render_source_inspect(project, (decided, info)))
     print()
     print(f"PLAN WRITTEN: {path}")
-    print(f"MANIFEST    : {workdir / SOURCE_MANIFEST_FILE} ({len(entries)} files, "
+    print(f"MANIFEST    : {manifest_path} ({len(entries)} files, "
           f"{human_bytes(total)})")
     print(f"DESTINATION : {kind} — {detail}")
     print(f"APPROVE WITH: --approve-manifest {digest}")
@@ -2078,9 +2267,10 @@ def read_plan(workdir: Path) -> dict:
     plan = read_safe(plan_path)
     fields = parse_fields(plan, ("- Project slug:", "- Local project path:", "- Destination:",
                                  "- Branch:", "- Manifest SHA-256:", "- Authorized by:",
-                                 "- Mode:"))
+                                 "- Authorization statement:", "- Mode:", "- Planned HEAD:"))
     for key in ("- Project slug:", "- Local project path:", "- Destination:", "- Branch:",
-                "- Manifest SHA-256:"):
+                "- Manifest SHA-256:", "- Authorized by:", "- Authorization statement:",
+                "- Mode:", "- Planned HEAD:"):
         if not fields.get(key):
             fail(f"{SOURCE_PLAN_FILE} is missing {key}")
     manifest_text = read_safe(manifest_path)
@@ -2093,15 +2283,107 @@ def read_plan(workdir: Path) -> dict:
             fail(f"{SOURCE_MANIFEST_FILE} has a malformed line: {line}")
         digest, size, rel = parts
         entries.append((rel, int(size), digest))
+    digest = source_approval_digest(
+        slug=fields["- Project slug:"].strip("` "),
+        project=fields["- Local project path:"].strip("` "),
+        destination=fields["- Destination:"].strip("` "),
+        branch=fields["- Branch:"].strip("` "), mode=fields["- Mode:"].strip(),
+        planned_head=fields["- Planned HEAD:"].strip("` "),
+        authorized_by=fields["- Authorized by:"].strip(),
+        statement=fields["- Authorization statement:"].strip(), manifest=body)
     return {"workdir": workdir, "plan_path": plan_path, "manifest_path": manifest_path,
             "plan": plan, "fields": fields, "body": body, "entries": entries,
-            "digest": sha256_text(body)}
+            "digest": digest}
 
 
+@contextlib.contextmanager
+def source_publish_lock(project: Path):
+    """Serialize publications from one local project, including across work directories."""
+    identity = hashlib.sha256(str(project.resolve()).encode("utf-8")).hexdigest()[:24]
+    lock = Path(tempfile.gettempdir()) / f"ai-context-hub-source-{identity}.lock"
+    token = f"{os.getpid()} {uuid.uuid4().hex}\n"
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(descriptor, token.encode("ascii"))
+        finally:
+            os.close(descriptor)
+    except FileExistsError:
+        fail(f"Another source publication is active for {project}. Retry after it finishes; "
+             f"if the process crashed, inspect the stale lock at {lock}.")
+    try:
+        yield
+    finally:
+        try:
+            if lock.read_text(encoding="ascii") == token:
+                lock.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def serialize_source_publish(function):
+    @functools.wraps(function)
+    def guarded(workdir: Path, *args, **kwargs):
+        record = read_plan(workdir)
+        project = Path(record["fields"]["- Local project path:"].strip("` ")).resolve()
+        with source_publish_lock(project):
+            return function(workdir, *args, **kwargs)
+    return guarded
+
+
+def write_source_pending(record: dict, destination: str, branch: str, mode: str,
+                         sha: str, parent: str) -> None:
+    body = ("# Pending source publication\n\n"
+            f"- Destination: {destination}\n- Branch: {branch}\n- Mode: {mode}\n"
+            f"- Manifest SHA-256: {record['digest']}\n- Commit SHA: {sha}\n"
+            f"- Parent SHA: {parent or '-'}\n\n"
+            "This commit was created from the approved manifest but has not yet been recorded as "
+            "successfully pushed. A retry reuses this exact commit.\n")
+    check_secrets(body)
+    path = record["workdir"] / SOURCE_PENDING_FILE
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(body)
+
+
+def read_source_pending(record: dict, destination: str, branch: str, mode: str) -> str:
+    path = record["workdir"] / SOURCE_PENDING_FILE
+    if not path.is_file():
+        return ""
+    fields = parse_fields(read_safe(path), ("- Destination:", "- Branch:", "- Mode:",
+                                             "- Manifest SHA-256:", "- Commit SHA:"))
+    if (fields.get("- Destination:") != destination or fields.get("- Branch:") != branch
+            or fields.get("- Mode:") != mode
+            or fields.get("- Manifest SHA-256:") != record["digest"]):
+        fail(f"{SOURCE_PENDING_FILE} does not match the approved plan. Inspect it manually; "
+             "nothing was pushed.")
+    sha = fields.get("- Commit SHA:", "")
+    if not CODE_SHA.fullmatch(sha):
+        fail(f"{SOURCE_PENDING_FILE} contains an invalid commit SHA; nothing was pushed.")
+    return sha
+
+
+def prior_source_result(record: dict, destination: str, branch: str) -> str:
+    path = record["workdir"] / SOURCE_RESULT_FILE
+    if not path.is_file():
+        return ""
+    fields = parse_fields(read_safe(path), ("- Destination:", "- Branch:", "- Commit SHA:",
+                                            "- Manifest SHA-256:"))
+    if (fields.get("- Destination:") != destination or fields.get("- Branch:") != branch
+            or fields.get("- Manifest SHA-256:") != record["digest"]):
+        fail(f"Existing {SOURCE_RESULT_FILE} does not match the approved source plan; refusing "
+             "to create another commit.")
+    sha = fields.get("- Commit SHA:", "")
+    if not CODE_SHA.fullmatch(sha):
+        fail(f"Existing {SOURCE_RESULT_FILE} has an invalid commit SHA.")
+    return sha
+
+
+@serialize_source_publish
 def source_publish(workdir: Path, *, approve_manifest: str, message: str,
                    remote_name: str = "origin") -> None:
     """First upload of an approved manifest, or a later push of new commits."""
     approve_manifest = one_line(approve_manifest, "--approve-manifest")
+    message = one_line(message, "--message")
     record = read_plan(workdir)
     fields = record["fields"]
     if record["digest"] != approve_manifest:
@@ -2115,6 +2397,7 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
         fail(f"The planned local project no longer exists: {project}")
     dest = fields["- Destination:"].strip("` ")
     branch = fields["- Branch:"].strip("` ")
+    planned_head = fields["- Planned HEAD:"].strip("` ")
     slug = fields["- Project slug:"].strip("` ")
     mode = fields["- Mode:"].strip() if fields.get("- Mode:") else "history"
     if mode not in SOURCE_MODES:
@@ -2122,6 +2405,9 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
     check_slug(slug, "project slug")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,120}", branch):
         fail(f"Unsafe branch name in the plan: {branch}")
+    if planned_head != "-" and not CODE_SHA.fullmatch(planned_head):
+        fail(f"Invalid planned HEAD in {SOURCE_PLAN_FILE}: {planned_head!r}")
+    require_publish_destination(dest)
 
     missing, changed, total = [], [], 0
     for rel, size, digest in record["entries"]:
@@ -2141,8 +2427,16 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
     if total > MAX_SOURCE_TOTAL:
         fail(f"Approved bytes now total {human_bytes(total)}, above the ceiling.")
 
+    completed_source = prior_source_result(record, dest, branch)
+    # ``git var`` can resolve environment/global identity outside a repository. Check before
+    # ``git init`` so a missing author never leaves metadata behind in a plain project.
+    require_git_identity(project)
     fresh_repo = not (project / ".git").is_dir()
+    history_pending = ""
     if fresh_repo:
+        if planned_head != "-":
+            fail("The plan expected an existing Git HEAD, but the project is no longer a Git "
+                 "repository. Nothing was initialized.")
         run_git(project, "init", "-b", branch)
         print(f"Initialized a new Git repository in {project} on branch {branch} (no history existed).")
     else:
@@ -2150,14 +2444,23 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
         if not current:
             fail("The project is on a detached HEAD. Check out a named branch before publishing.")
         if mode == "history" and current != branch:
-            exists = run_git(project, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
-                             check=False).returncode == 0
-            if not exists:
-                fail(f"The plan targets branch '{branch}' but the project is on '{current}', and "
-                     f"'{branch}' does not exist locally. Refusing to create and populate a branch "
-                     f"you did not check out; switch to it (or re-plan with --branch {current}).")
-    require_git_identity(project)
-
+            fail(f"The plan targets branch '{branch}' but the project is currently on '{current}'. "
+                 "History mode commits and pushes only the checked-out branch; switch to the "
+                 "planned branch or make a fresh plan for the current branch.")
+        if mode == "history":
+            actual_head = run_git(project, "rev-parse", "HEAD", check=False).stdout.strip() or "-"
+            history_pending = read_source_pending(record, dest, branch, mode)
+            if actual_head != planned_head:
+                preserved = history_pending or completed_source
+                if not preserved or actual_head != preserved:
+                    fail(f"History changed after approval: planned HEAD {planned_head}, current "
+                         f"HEAD {actual_head}. Refusing to publish unapproved ancestors; make a "
+                         "fresh plan.")
+                parents = run_git(project, "log", "-1", "--format=%P", actual_head).stdout.strip()
+                expected_parents = "" if planned_head == "-" else planned_head
+                if parents != expected_parents:
+                    fail("The preserved pending history commit is not a single child of the "
+                         "approved HEAD. Refusing to publish it.")
     manifest_set = {rel for rel, _size, _digest in record["entries"]}
 
     existing = run_git(project, "remote", "get-url", remote_name, check=False)
@@ -2171,38 +2474,72 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
         run_git(project, "remote", "add", remote_name, dest)
         print(f"Added remote {remote_name} -> {dest}")
 
-    remote_has_branch = run_git(project, "ls-remote", "--exit-code", "--heads", remote_name,
-                                branch, check=False).returncode == 0
-    if remote_has_branch:
-        run_git(project, "fetch", remote_name, branch, check=False)
-
     if mode == "snapshot":
         # Publish exactly the approved files as one commit. The project's own branches, index,
-        # reflog, working tree and history are never touched or uploaded.
-        sha = snapshot_commit(project, record["entries"], message, branch)
-        if remote_has_branch and run_git(project, "merge-base", "--is-ancestor", "FETCH_HEAD", sha,
-                                        check=False).returncode != 0:
-            fail(f"Divergent remote: {remote_name}/{branch} already holds commits that are not part "
-                 "of this snapshot chain. Refusing to force-push. Nothing was pushed.")
-        pushed = run_git(project, "push", remote_name, f"{sha}:refs/heads/{branch}", check=False)
-        if pushed.returncode:
-            detail = (pushed.stderr or pushed.stdout).strip().splitlines()
-            fail("Push failed. The snapshot commit and every working file are preserved; fix access "
-                 "and rerun the same command. Git said: "
-                 + (detail[-1] if detail else "no output"))
-        head_files = {item for item in run_git(project, "ls-tree", "-r", "--name-only", "-z", sha)
-                      .stdout.split("\0") if item}
-        extra = sorted(head_files - manifest_set)
-        absent = sorted(manifest_set - head_files)
-        if extra or absent:
-            fail(f"Internal check failed: the snapshot does not match the approved manifest "
-                 f"({len(extra)} extra, {len(absent)} missing). Investigate before trusting it.")
+        # refs, reflog, working tree and history are never touched or uploaded. Using the literal
+        # destination for fetch/push also prevents Git from updating a remote-tracking ref.
+        remote_sha = remote_branch_sha(project, dest, branch)
+        ensure_remote_commit(project, dest, branch, remote_sha)
+        completed = completed_source
+        if remote_sha and not completed:
+            require_snapshot_lineage(project, remote_sha, remote_name, branch)
+        if completed:
+            verify_commit_manifest(project, completed, record["entries"])
+            if remote_sha != completed:
+                fail(f"This snapshot plan already records commit {completed}, but the destination "
+                     f"now points to {remote_sha or '(missing)'}. Refusing to create or force a new "
+                     "commit; make a fresh plan for the current destination state.")
+            sha = completed
+        else:
+            pending = read_source_pending(record, dest, branch, mode)
+            if pending:
+                if run_git(project, "cat-file", "-e", f"{pending}^{{commit}}",
+                           check=False).returncode:
+                    fail(f"{SOURCE_PENDING_FILE} names a commit that is no longer available in the "
+                         "project object database; nothing was pushed.")
+                sha = pending
+            else:
+                sha = snapshot_commit(project, record["entries"], message, branch,
+                                      parent=remote_sha)
+                write_source_pending(record, dest, branch, mode, sha, remote_sha)
+            verify_commit_manifest(project, sha, record["entries"])
+            if remote_sha and remote_sha != sha and run_git(
+                    project, "merge-base", "--is-ancestor", remote_sha, sha,
+                    check=False).returncode != 0:
+                fail(f"Divergent remote: {remote_name}/{branch} is not an ancestor of the preserved "
+                     "snapshot commit. Refusing to force-push; make a fresh plan after reconciling "
+                     "the destination.")
+            if not remote_sha:
+                parents = run_git(project, "log", "-1", "--format=%P", sha).stdout.strip()
+                if parents:
+                    fail("The destination branch is empty but the preserved snapshot has a parent. "
+                         "Refusing to publish an unexpected history.")
+            if remote_sha != sha:
+                require_publish_destination(dest)
+                pushed = run_git(project, "push", dest, f"{sha}:refs/heads/{branch}", check=False)
+                if pushed.returncode:
+                    detail = (pushed.stderr or pushed.stdout).strip().splitlines()
+                    fail("Push failed. The exact snapshot commit, approved manifest and every "
+                         "working file are preserved; fix access and rerun the same command. Git "
+                         "said: " + (detail[-1] if detail else "no output"))
         print(f"SNAPSHOT COMMIT: {sha} (project history untouched; "
-              f"{len(head_files)} files published)")
+              f"{len(record['entries'])} files published)")
         print(f"Local branch/uncommitted state unchanged: "
               f"{run_git(project, 'rev-parse', '--short', 'HEAD', check=False).stdout.strip() or '(none)'}"
               f" on {run_git(project, 'branch', '--show-current', check=False).stdout.strip() or '(detached)'}")
     else:
+        remote_sha = remote_branch_sha(project, remote_name, branch)
+        remote_has_branch = bool(remote_sha)
+        if remote_has_branch:
+            fetched = run_git(project, "fetch", remote_name, branch, check=False)
+            if fetched.returncode:
+                fail(f"Could not fetch {remote_name}/{branch} before checking divergence; nothing "
+                     "was staged or pushed.")
+        pre_staged = run_git(project, "diff", "--cached", "--name-only").stdout.splitlines()
+        if pre_staged:
+            fail("The project already has staged changes. Commit or unstage them before source "
+                 "publication so this command cannot replace an existing index state: "
+                 + ", ".join(pre_staged[:5]))
         unrelated = []
         for entry in (item for item in run_git(project, "status", "--porcelain", "-z",
                                               "--untracked-files=all").stdout.split("\0") if item):
@@ -2221,37 +2558,53 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
                  "ancestors of the local HEAD. Refusing to force-push or to merge automatically; "
                  "nothing was staged. Reconcile the two histories deliberately, then rerun.")
 
-        for start in range(0, len(record["entries"]), 100):
-            batch = [rel for rel, _size, _digest in record["entries"][start:start + 100]]
-            run_git(project, "add", "--", *batch)
+        index_value = run_git(project, "rev-parse", "--git-path", "index").stdout.strip()
+        index_path = Path(index_value)
+        if not index_path.is_absolute():
+            index_path = project / index_path
+        index_existed = index_path.is_file()
+        index_bytes = index_path.read_bytes() if index_existed else b""
+        index_mode = index_path.stat().st_mode if index_existed else 0o600
+        try:
+            for start in range(0, len(record["entries"]), 100):
+                batch = [rel for rel, _size, _digest in record["entries"][start:start + 100]]
+                run_git(project, "add", "--", *batch)
 
-        staged = [line for line in run_git(project, "diff", "--cached",
-                                          "--name-only").stdout.splitlines() if line]
-        head_ok = run_git(project, "rev-parse", "HEAD", check=False).returncode == 0
-        if staged:
-            run_git(project, "commit", "-q", "-m", message,
-                    "--", *[rel for rel, _size, _digest in record["entries"]])
-        elif head_ok:
-            print("Nothing new to commit from the approved manifest; retrying the push of the "
-                  "existing commit (no duplicate commit will be created).")
-        else:
-            fail("No commit exists and the approved manifest produced no staged change; "
-                 "nothing to push.")
+            staged = [line for line in run_git(project, "diff", "--cached",
+                                              "--name-only").stdout.splitlines() if line]
+            head_ok = run_git(project, "rev-parse", "HEAD", check=False).returncode == 0
+            if staged:
+                run_git(project, "commit", "-q", "-m", message,
+                        "--", *[rel for rel, _size, _digest in record["entries"]])
+            elif head_ok:
+                print("Nothing new to commit from the approved manifest; retrying the push of the "
+                      "existing commit (no duplicate commit will be created).")
+            else:
+                fail("No commit exists and the approved manifest produced no staged change; "
+                     "nothing to push.")
+        except BaseException:
+            if index_existed:
+                temporary = index_path.with_name(index_path.name + f".ach-{uuid.uuid4().hex}")
+                temporary.write_bytes(index_bytes)
+                temporary.chmod(index_mode)
+                os.replace(temporary, index_path)
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    index_path.unlink()
+            raise
         sha = run_git(project, "rev-parse", "HEAD").stdout.strip()
 
-        # The pushed tree — not the manifest — is what actually becomes visible, so they must match.
-        head_files = {item for item in run_git(project, "ls-tree", "-r", "--name-only", "-z", sha)
-                      .stdout.split("\0") if item}
-        extra = sorted(head_files - manifest_set)
-        absent = sorted(manifest_set - head_files)
-        if extra or absent:
-            fail(f"Refusing to push: the commit to be uploaded does not match the approved manifest "
-                 f"({len(extra)} unapproved tracked file(s), {len(absent)} approved file(s) missing). "
-                 + (f"Unapproved but present: {', '.join(extra[:8])}. " if extra else "")
-                 + (f"Approved but absent from the commit: {', '.join(absent[:8])}. " if absent else "")
-                 + "Remove them from the repository deliberately, or re-plan to include them. "
-                   "Nothing was pushed.")
+        # The immutable commit — names and bytes — is what actually becomes visible.
+        verify_commit_manifest(project, sha, record["entries"])
+        if history_pending:
+            if sha != history_pending:
+                fail(f"{SOURCE_PENDING_FILE} records {history_pending}, but the candidate commit is "
+                     f"{sha}. Refusing to replace preserved retry evidence.")
+        else:
+            write_source_pending(record, dest, branch, mode, sha,
+                                 "" if planned_head == "-" else planned_head)
 
+        require_publish_destination(dest)
         pushed = run_git(project, "push", remote_name, f"HEAD:refs/heads/{branch}", check=False)
         if pushed.returncode:
             detail = (pushed.stderr or pushed.stdout).strip().splitlines()
@@ -2273,6 +2626,8 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
               "AI tool can read the repository.\n")
     check_secrets(result)
     (record["workdir"] / SOURCE_RESULT_FILE).write_text(result, encoding="utf-8")
+    with contextlib.suppress(FileNotFoundError):
+        (record["workdir"] / SOURCE_PENDING_FILE).unlink()
     print(f"PUSHED: {sha}")
     print(f"RESULT WRITTEN: {record['workdir'] / SOURCE_RESULT_FILE}")
     print("Next: source-verify (fresh clone readback), then source-access for each other tool.")
@@ -2356,9 +2711,21 @@ def source_access(workdir: Path, *, tool: str, status: str, evidence: str,
     if status not in SOURCE_TOOL_STATUS:
         fail(f"--status must be one of: {', '.join(SOURCE_TOOL_STATUS)}")
     evidence = one_line(evidence, "--evidence")
+    sha = sha.strip()
+    if sha and not CODE_SHA.fullmatch(sha):
+        fail("--sha must be a 7-40 character lowercase Git commit SHA.")
     workdir = workdir.expanduser().resolve()
     if not (workdir / SOURCE_PLAN_FILE).is_file():
         fail(f"No source onboarding plan in {workdir}; run source-plan first.")
+    if status == "verified":
+        result_path = workdir / SOURCE_RESULT_FILE
+        if not result_path.is_file():
+            fail(f"A verified access record requires {SOURCE_RESULT_FILE} and its exact commit SHA.")
+        expected = parse_fields(read_safe(result_path), ("- Commit SHA:",)).get(
+            "- Commit SHA:", "")
+        if not sha or sha != expected:
+            fail(f"Verified access must name the exact published commit {expected}; the record was "
+                 "not written.")
     path = workdir / SOURCE_ACCESS_FILE
     header = ("# Independent read access — recorded per tool\n\n"
               "Each line is one tool's *own* verification that it can read the source repository.\n"
@@ -2366,7 +2733,7 @@ def source_access(workdir: Path, *, tool: str, status: str, evidence: str,
               "inferred from the pushing machine.\n\n"
               "| when (UTC) | tool | status | commit | evidence |\n"
               "| --- | --- | --- | --- | --- |\n")
-    line = f"| {stamp()} | {tool} | {status} | {sha.strip() or '-'} | {evidence} |\n"
+    line = f"| {stamp()} | {tool} | {status} | {sha or '-'} | {evidence} |\n"
     check_secrets(line)
     if path.is_file():
         text = read_safe(path)
@@ -2560,7 +2927,8 @@ def main(argv: list[str] | None = None) -> int:
     sa.add_argument("--tool", required=True, help="Tool name being verified (e.g. chatgpt)")
     sa.add_argument("--status", required=True, choices=SOURCE_TOOL_STATUS)
     sa.add_argument("--evidence", required=True, help="What that tool actually did")
-    sa.add_argument("--sha", default="")
+    sa.add_argument("--sha", default="",
+                    help="Exact published commit; required when --status verified")
 
     args = p.parse_args(argv)
     root = root_path(args.root)

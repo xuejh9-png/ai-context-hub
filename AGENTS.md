@@ -113,10 +113,11 @@ how source leaks, so treat each gate as a requirement rather than advice.
 2. **Do not upload anything the owner has not confirmed.** The local directory, the intended
    private repository, the file list and the first commit all need explicit owner
    authorization. Never upload a private business project on your own initiative.
-3. **Verify private visibility; never assert it.** A `github.com` destination that answers the
-   unauthenticated API is public and must be refused. If the destination does not exist, report
-   the exact setup requirement — do not invent success and do not create a repository with
-   credentials you do not hold.
+3. **Verify private visibility; never assert it.** A `github.com` destination is accepted only
+   when the unauthenticated API returns exactly `404` and authenticated Git access succeeds.
+   Public `200`, rate limits and ambiguous API/network failures must be refused. If the
+   destination does not exist, report the exact setup requirement — do not invent success and do
+   not create a repository with credentials you do not hold.
 4. **Publish exactly the approved manifest.** `source-publish` requires the digest printed by
    `source-plan`. Never widen the selection between approval and upload; re-plan and re-approve
    instead.
@@ -126,7 +127,8 @@ how source leaks, so treat each gate as a requirement rather than advice.
    the code is available.
 7. **Keep the three tools separate.** A successful push and read-back by WorkBuddy is not
    evidence that ChatGPT or Codex can read the repository. Record each tool's own result with
-   `source-access`; until then the status is `NOT VERIFIED`.
+   `source-access` and bind a `verified` record to the exact published commit SHA; until then the
+   status is `NOT VERIFIED`.
 7b. **A tracked file is in history.** If the owner asks you to exclude an already-committed
    path with `--deny`, the tool refuses: excluding it locally does not remove it from history.
    Report that plainly and let the owner decide — never rewrite history to make the exclusion

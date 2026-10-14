@@ -24,7 +24,7 @@ repository.
 | --- | --- | --- |
 | `source-inspect --path DIR` | Read-only inspection: Git facts, candidate upload set, hard denials, review items, ignored build directories | stdout (and `--out` if given) |
 | `source-plan` | Computes the exact file list, checks the destination, records the owner's authorization, writes `SOURCE_PLAN.md` + `SOURCE_MANIFEST.txt` | the work directory only |
-| `source-publish` | First upload (or a later push) of exactly the approved manifest; idempotent; never force-pushes | the project (commit) + the destination repository |
+| `source-publish` | First upload (or a later push) of exactly the approved manifest; idempotent; serialized per local project; never force-pushes | history mode: project commit; snapshot mode: Git objects only; plus the destination repository and work-directory evidence |
 | `source-verify` | Fresh clone into a temporary directory, verifies the commit SHA and every file byte for byte, then deletes the clone | the work directory only |
 | `source-access` | Records one **other** tool's own read access, per tool | the work directory only |
 
@@ -44,10 +44,12 @@ approval.
 | `snapshot` | One commit containing exactly the approved files. The project's branches, index, reflog, working tree and history are **not** modified and **not** uploaded | You want another tool to read the current code without publishing everything the project's history has ever contained |
 
 `snapshot` is the honest answer to "please exclude this, but it is already committed". It is
-built through a private index file and `git commit-tree`, so nothing in the project changes;
-later snapshots chain onto the previous one through a local `refs/ach/snapshot/<branch>`
-ref, which means the destination gets a clean linear history of code-only commits that still
-fast-forwards without ever forcing.
+built through a private index file and `git commit-tree`. The destination's verified snapshot
+tip is passed directly as the next parent, so local branches, refs, reflogs, the index and the
+working tree do not change. Snapshot commits carry an AI Context Hub lineage marker; an existing
+branch without that marker is treated as unrelated history and refused. A failed push writes
+`SOURCE_PENDING.md` in the work directory, and a retry reuses that exact commit. The pending file
+is removed only after `SOURCE_RESULT.md` records success.
 
 Both modes share every other gate: destination verification, digest approval, manifest
 re-verification, the tree-equals-manifest check, divergence refusal and failure recovery.
@@ -63,29 +65,33 @@ absent from the destination, because no history is uploaded.
    it found that must not be uploaded.
 2. **Hard denials are refusals, not exclusions.** Environment files, key material,
    keystores, databases and credential patterns abort planning. They cannot be overridden.
-3. **History is checked too.** If a denied path ever entered the project's Git history,
-   pushing that history would publish it. The tool refuses and never rewrites history.
+3. **History is checked too.** History mode scans historical path names and the bytes of reachable
+   historical blobs. Credential patterns, denied types, archives/backups/dumps, oversized blobs,
+   an incomplete scan, or owner-denied paths refuse the plan because pushing history would publish
+   them. The tool never rewrites history; snapshot mode remains available.
 4. **Archive/backup/oversized files need explicit promotion.** They are excluded by default
    and listed; `--allow-review` promotes them after a deliberate decision.
 5. **The project's own `.gitignore` is respected.** For a Git project the selection is the
    already-tracked set, so a reviewed ignore file is what defines "source". Untracked files
    are listed as *not included*, never silently dropped.
 6. **Private visibility must be verified, not asserted.** For a `github.com` destination the
-   tool asks the unauthenticated API: a `200` means the repository is public and planning is
-   refused. A non-public repository must additionally be reachable by Git on this machine,
-   which is what proves it exists and is private.
+   unauthenticated API must return exactly `404`, and authenticated Git access must succeed.
+   `200` is public; API errors, rate limits and every ambiguous response fail closed. Publication
+   repeats the privacy/access check after approval and again immediately before the push.
 7. **Explicit owner authorization.** Planning requires `--authorize` (who) and `--statement`
-   (what they decided), and publication requires `--approve-manifest <digest>` — the SHA-256
-   of the exact file list. Approving a digest means you reviewed that list.
-8. **The pushed tree must equal the approved manifest.** Before pushing, the tool compares
-   the commit's file list with the approved manifest in both directions and refuses on any
-   difference. The manifest is what was approved; the tree is what becomes visible.
+   (what they decided), and publication requires `--approve-manifest <digest>`. That SHA-256
+   binds the local project path, destination, branch, mode, planned HEAD, authorizer, statement
+   and exact file manifest. Editing any publication-critical field invalidates the approval.
+8. **The pushed tree must equal the approved manifest.** Before pushing, the tool compares both
+   the path set and every immutable commit-blob byte against the approved size and SHA-256. This
+   closes the gap where a working file changes after validation but before `git add`.
 9. **Non-destructive Git handling.** An existing repository keeps its history and its
    `origin`; a different `origin` is a hard refusal (no repointing). A project without Git is
    initialised only after approval, and only with `git init`. There is no force-push, ever.
-10. **Failures preserve everything.** A rejected or failed push leaves the local commit and
-    every working file untouched and prints how to retry; rerunning never creates a duplicate
-    commit.
+10. **Failures preserve everything.** A rejected or failed push leaves the local commit and every
+    working file available and prints how to retry. Both modes bind a preserved retry commit in
+    `SOURCE_PENDING.md`; history-mode commit failures restore the exact pre-command index bytes.
+    Existing staged changes are refused up front rather than replaced.
 11. **Divergence stops the upload.** If the destination already holds commits that are not
     ancestors of the local HEAD, the upload is refused instead of merging or forcing.
 12. **The owner can declare their own deny patterns** with `--deny <glob>`. Those paths are
@@ -94,6 +100,13 @@ absent from the destination, because no history is uploaded.
     this tool never rewrites history. For a Git project that means `--deny` can only act on
     files that are not tracked yet (untracked additions, or a project without Git). Declaring
     a tracked path as denied is a request to be told the truth, not a way to hide it.
+13. **Concurrent publication is serialized.** A host-local lock derived from the resolved project
+    path prevents two work directories from committing or pushing that project at once. The lock is
+    removed on normal success or failure; after a process crash, its reported lock file must be
+    inspected and removed manually.
+14. **History cannot change after approval.** History mode records the planned HEAD and requires the
+    same branch and HEAD at publication. The only allowed successor is the exact one-commit retry
+    already recorded by this tool after a failed push; its parent must be the approved HEAD.
 
 ## Honest limits
 
@@ -136,7 +149,8 @@ ach source-verify --workdir ~/source-onboarding/some-project
 ach source-access --workdir ~/source-onboarding/some-project \
     --tool chatgpt --status pending --evidence "connector not yet pointed at the repo"
 ach source-access --workdir ~/source-onboarding/some-project \
-    --tool codex --status verified --evidence "cloned <url> and read src/main.py"
+    --tool codex --status verified --sha <exact-published-commit> \
+    --evidence "cloned <url> and read src/main.py"
 ```
 
 Then continue development normally in the source repository with branches and pull requests,
