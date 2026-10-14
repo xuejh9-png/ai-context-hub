@@ -64,6 +64,12 @@ never write into the project.
     commit.
 11. **Divergence stops the upload.** If the destination already holds commits that are not
     ancestors of the local HEAD, the upload is refused instead of merging or forcing.
+12. **The owner can declare their own deny patterns** with `--deny <glob>`. Those paths are
+    excluded from the manifest, and if any of them appears in the project's Git history the
+    plan is refused — because excluding a path locally does not remove it from history, and
+    this tool never rewrites history. For a Git project that means `--deny` can only act on
+    files that are not tracked yet (untracked additions, or a project without Git). Declaring
+    a tracked path as denied is a request to be told the truth, not a way to hide it.
 
 ## Honest limits
 

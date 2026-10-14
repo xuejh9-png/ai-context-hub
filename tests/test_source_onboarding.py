@@ -130,12 +130,13 @@ class SourceFixture(unittest.TestCase):
 
     def plan(self, project: Path, dest, *, slug: str = "demo", work: Path | None = None,
              api_probe=None, remote_probe=None, includes=(), allow_review=(),
-             branch="") -> str:
+             branch="", deny=()) -> str:
         _, digest = ach.source_plan(project, slug, str(dest), work or self.work,
                                    authorize="demo-owner",
                                    statement="approved: first upload of the reviewed file list",
                                    includes=includes, allow_review=allow_review,
-                                   branch=branch, api_probe=api_probe, remote_probe=remote_probe)
+                                   branch=branch, api_probe=api_probe, remote_probe=remote_probe,
+                                   deny=deny)
         return digest
 
 
@@ -441,6 +442,41 @@ class SourcePublishTests(SourceFixture):
         with self.assertRaises(ach.HubError) as caught:
             ach.source_publish(self.work, approve_manifest=digest, message="x")
         self.assertIn("does not exist locally", str(caught.exception))
+
+    def test_owner_declared_deny_patterns_exclude_files_from_the_manifest(self):
+        # A Git-tracked path is necessarily in history, so --deny can only act on files
+        # that are not tracked yet: untracked additions, or a non-Git project.
+        project = self.root / "plain-with-artifacts"
+        (project / "src").mkdir(parents=True)
+        (project / "src" / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (project / "artifacts").mkdir()
+        (project / "artifacts" / "shot-01.png").write_bytes(b"\x89PNG\r\n\x1a\nsynthetic")
+
+        report = ach.source_inspect(project, deny=("artifacts/*",))
+        self.assertIn("EXCLUDED BY OWNER POLICY", report)
+        self.assertIn("POLICY", report)
+        self.assertIn("artifacts/shot-01.png", report)
+
+        remote = self.make_remote()
+        digest = self.plan(project, remote, deny=("artifacts/*",), branch="main")
+        manifest = (self.work / ach.SOURCE_MANIFEST_FILE).read_text(encoding="utf-8")
+        self.assertNotIn("artifacts/shot-01.png", manifest)
+        self.assertIn("src/main.py", manifest)
+        plan = (self.work / ach.SOURCE_PLAN_FILE).read_text(encoding="utf-8")
+        self.assertIn("--deny): artifacts/*", plan)
+        ach.source_publish(self.work, approve_manifest=digest, message="Initial upload")
+        self.assertNotIn("artifacts/shot-01.png", self.remote_files(remote))
+
+    def test_owner_declared_deny_pattern_in_history_refuses_the_plan(self):
+        project = self.make_git_project(extra_files={"artifacts/shot-01.png": b"PK\x03\x04data"})
+        self.commit_all(project)
+        remote = self.make_remote()
+        with self.assertRaises(ach.HubError) as caught:
+            self.plan(project, remote, deny=("artifacts/*",))
+        message = str(caught.exception)
+        self.assertIn("owner-declared policy pattern present in Git history", message)
+        self.assertIn("never rewrites history", message)
+        self.assertFalse((self.work / ach.SOURCE_MANIFEST_FILE).exists())
 
     def test_verify_refuses_before_a_publish_has_happened(self):
         project = self.make_git_project()

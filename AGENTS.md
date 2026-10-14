@@ -127,6 +127,10 @@ how source leaks, so treat each gate as a requirement rather than advice.
 7. **Keep the three tools separate.** A successful push and read-back by WorkBuddy is not
    evidence that ChatGPT or Codex can read the repository. Record each tool's own result with
    `source-access`; until then the status is `NOT VERIFIED`.
+7b. **A tracked file is in history.** If the owner asks you to exclude an already-committed
+   path with `--deny`, the tool refuses: excluding it locally does not remove it from history.
+   Report that plainly and let the owner decide — never rewrite history to make the exclusion
+   "work".
 8. **Refuse without proof.** A claim that "the project is now shared" is only valid when the
    agent read-back AND at least one independent tool read are both recorded.
 9. **Record the version in the context.** After further development, write a completion handoff

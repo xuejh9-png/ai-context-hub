@@ -1607,7 +1607,8 @@ def walk_project(project: Path) -> list[tuple[str, Path, int]]:
     return sorted(found)
 
 
-def select_source_files(project: Path, includes: tuple[str, ...]) -> tuple[list, dict]:
+def select_source_files(project: Path, includes: tuple[str, ...],
+                        deny: tuple[str, ...] = ()) -> tuple[list, dict]:
     """Determine the candidate set. Tracked files only when the project is a Git repo."""
     notes: list[str] = []
     candidates: dict[str, tuple[Path, int]] = {}
@@ -1668,12 +1669,16 @@ def select_source_files(project: Path, includes: tuple[str, ...]) -> tuple[list,
     hard: list[tuple[str, str]] = []
     review: list[tuple[str, str, int]] = []
     flagged: list[tuple[str, list[str]]] = []
+    policy: list[tuple[str, int]] = []
     scan_budget = [SOURCE_SCAN_FILES]
     for rel in sorted(candidates):
         path, size = candidates[rel]
         reason = source_deny_reason(rel, path, scan_budget)
         if reason:
             hard.append((rel, reason))
+            continue
+        if any(fnmatch.fnmatch(rel, pattern) for pattern in deny):
+            policy.append((rel, size))
             continue
         review_reason = source_review_reason(rel, path, size)
         if review_reason:
@@ -1684,10 +1689,10 @@ def select_source_files(project: Path, includes: tuple[str, ...]) -> tuple[list,
             flagged.append((rel, flagged_words))
         decided.append((rel, path, size))
     return decided, {"notes": notes, "hard": hard, "review": review, "flagged": flagged,
-                     "candidates": candidates}
+                     "policy": policy, "candidates": candidates}
 
 
-def source_history_findings(project: Path) -> list[tuple[str, str]]:
+def source_history_findings(project: Path, deny: tuple[str, ...] = ()) -> list[tuple[str, str]]:
     """Any denied path that ever entered the project's Git history would be uploaded too."""
     if not (project / ".git").is_dir():
         return []
@@ -1709,6 +1714,8 @@ def source_history_findings(project: Path) -> list[tuple[str, str]]:
             if (name.startswith(".env") and name != ".env.example") or name in SOURCE_DENY_NAMES \
                     or Path(rel).suffix.lower() in SOURCE_DENY_SUFFIX:
                 reason = "denied file type present in Git history"
+        if reason is None and any(fnmatch.fnmatch(rel, pattern) for pattern in deny):
+            reason = "owner-declared policy pattern present in Git history"
         if reason:
             seen[rel] = reason
     return sorted(seen.items())
@@ -1737,7 +1744,7 @@ def ignored_dir_summary(project: Path) -> list[tuple[str, int, int]]:
     return sorted(summary, key=lambda item: -item[2])[:10]
 
 
-def render_source_inspect(project: Path, selection) -> str:
+def render_source_inspect(project: Path, selection, deny: tuple[str, ...] = ()) -> str:
     decided, info = selection
     total = sum(size for _rel, _path, size in decided)
     lines = ["SOURCE PROJECT INSPECTION (read-only)", "=" * 60,
@@ -1777,8 +1784,14 @@ def render_source_inspect(project: Path, selection) -> str:
     if not info["flagged"]:
         lines.append("    (none)")
     lines.append("")
+    lines.append(f"EXCLUDED BY OWNER POLICY (--deny) : {len(info.get('policy', []))}")
+    for rel, size in info.get("policy", [])[:25]:
+        lines.append(f"    POLICY  {human_bytes(size):>10}  {rel}")
+    if not info.get("policy"):
+        lines.append("    (none)")
+    lines.append("")
     lines.append("HARD-DENIED IN GIT HISTORY :")
-    history = source_history_findings(project)
+    history = source_history_findings(project, deny)
     lines += [f"    DENY  {rel}  ({reason})" for rel, reason in history[:25]] or ["    (none)"]
     lines.append("")
     lines.append("IGNORED DIRECTORIES PRESENT (not uploaded, listed for awareness):")
@@ -1794,10 +1807,10 @@ def render_source_inspect(project: Path, selection) -> str:
     return "\n".join(lines)
 
 
-def source_inspect(project: Path, includes: tuple[str, ...] = (),
+def source_inspect(project: Path, includes: tuple[str, ...] = (), deny: tuple[str, ...] = (),
                    manifest_out: Path | None = None) -> str:
-    selection = select_source_files(project, includes)
-    report = render_source_inspect(project, selection)
+    selection = select_source_files(project, includes, deny)
+    report = render_source_inspect(project, selection, deny)
     if manifest_out is not None:
         target = manifest_out.expanduser()
         if target.exists():
@@ -1895,7 +1908,8 @@ def build_manifest(project: Path, decided) -> tuple[str, str]:
 
 def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize: str,
                 statement: str, includes: tuple[str, ...], allow_review: tuple[str, ...],
-                branch: str = "", api_probe=None, remote_probe=None) -> tuple[Path, str]:
+                branch: str = "", api_probe=None, remote_probe=None,
+                deny: tuple[str, ...] = ()) -> tuple[Path, str]:
     project = project.expanduser().resolve()
     slug = check_slug(slug, "project slug")
     authorize = one_line(authorize, "--authorize")
@@ -1915,17 +1929,18 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
     if kind == "refused":
         fail(f"Destination not usable: {detail}")
 
-    decided, info = select_source_files(project, includes)
-    history = source_history_findings(project)
+    decided, info = select_source_files(project, includes, deny)
+    history = source_history_findings(project, deny)
     if info["hard"]:
         listing = "; ".join(f"{rel} ({reason})" for rel, reason in info["hard"][:5])
         fail(f"Refusing to plan: {len(info['hard'])} hard-denied file(s) are selected for upload. "
              f"Remove or ignore them first: {listing}")
     if history:
         listing = "; ".join(f"{rel} ({reason})" for rel, reason in history[:5])
-        fail(f"Refusing to plan: {len(history)} hard-denied path(s) exist in this project's Git "
-             "history, so pushing that history would upload them too. This tool never rewrites "
-             f"history: {listing}")
+        fail(f"Refusing to plan: {len(history)} denied path(s) exist in this project's Git history, "
+             "so pushing that history would upload them too. Excluding a path here does not remove "
+             "it from history, and this tool never rewrites history. Either upload without that "
+             f"policy, or rewrite the history yourself first: {listing}")
 
     promoted, remaining = [], []
     for rel, reason, size in info["review"]:
@@ -1964,7 +1979,9 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
         f"- Authorized by: {authorize}\n- Authorization statement: {statement}\n"
         f"- Files approved: {len(entries)}\n- Total bytes: {total} ({human_bytes(total)})\n"
         f"- Manifest SHA-256: {digest}\n"
-        f"- Git handling: {init_note}\n\n"
+        f"- Git handling: {init_note}\n"
+        f"- Owner-declared deny patterns (--deny): {', '.join(deny) or 'none'}\n"
+        f"- Excluded by those patterns: {len(info.get('policy', []))}\n\n"
         "## Hard rules applied to this selection\n\n"
         "- Environment files, key material, databases and credential patterns are refused, not "
         "merely excluded, and cannot be overridden.\n"
@@ -1980,6 +1997,9 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
         "## Promoted past review by explicit authorization\n\n"
         + ("\n".join(f"- `{rel}` — {reason} ({human_bytes(size)})"
                      for rel, reason, size in sorted(promoted)) or "- none") + "\n\n"
+        "## Excluded by owner-declared deny patterns\n\n"
+        + ("\n".join(f"- `{rel}` — {human_bytes(size)}" for rel, size in info.get("policy", []))
+           or "- none") + "\n\n"
         "## Next step\n\n"
         f"`source-publish --workdir {workdir} --approve-manifest {digest}`\n\n"
         "Approving the digest means you have reviewed the exact file list in "
@@ -2418,6 +2438,8 @@ def main(argv: list[str] | None = None) -> int:
     si.add_argument("--path", required=True, help="Absolute path of the local project")
     si.add_argument("--include", action="append", default=[],
                     help="Extra path/glob to consider (repeatable)")
+    si.add_argument("--deny", action="append", default=[],
+                    help="Owner policy glob that must never be uploaded (repeatable)")
     si.add_argument("--out", default="", help="Also write the report to this file")
     si.add_argument("--manifest-out", default="",
                     help="Also write the candidate file list (review copy, not an approval)")
@@ -2433,6 +2455,8 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--branch", default="",
                     help="Target branch; defaults to the project's current branch (or main)")
     sp.add_argument("--include", action="append", default=[])
+    sp.add_argument("--deny", action="append", default=[],
+                    help="Owner policy glob that must never be uploaded (repeatable)")
     sp.add_argument("--allow-review", action="append", default=[],
                     help="Glob promoting a review-required file into the manifest")
     spp = sub.add_parser("source-publish",
@@ -2510,6 +2534,7 @@ def main(argv: list[str] | None = None) -> int:
             return onboard_check(root, source_repo=args.source_repo, prove_push=args.prove_push)
         elif args.command == "source-inspect":
             report = source_inspect(source_project_path(args.path), tuple(args.include),
+                                    tuple(args.deny),
                                     Path(args.manifest_out) if args.manifest_out else None)
             print(report)
             if args.out:
@@ -2522,7 +2547,7 @@ def main(argv: list[str] | None = None) -> int:
             source_plan(source_project_path(args.path), args.project, args.dest,
                         Path(args.workdir), authorize=args.authorize, statement=args.statement,
                         includes=tuple(args.include), allow_review=tuple(args.allow_review),
-                        branch=args.branch)
+                        branch=args.branch, deny=tuple(args.deny))
         elif args.command == "source-publish":
             source_publish(Path(args.workdir), approve_manifest=args.approve_manifest,
                            message=args.message)
