@@ -32,6 +32,30 @@ repository.
 that **must exist and must be outside the inspected project**, so inspection and planning can
 never write into the project.
 
+## Publishing modes
+
+`source-plan --mode` chooses what the destination actually receives. The plan records the
+mode, and `source-publish` honours the recorded value, so the mode cannot be changed after
+approval.
+
+| Mode | What the destination receives | When to use it |
+| --- | --- | --- |
+| `history` (default) | The project's existing commits, pushed as-is | You want the destination to be a real clone of the project, with its Git history |
+| `snapshot` | One commit containing exactly the approved files. The project's branches, index, reflog, working tree and history are **not** modified and **not** uploaded | You want another tool to read the current code without publishing everything the project's history has ever contained |
+
+`snapshot` is the honest answer to "please exclude this, but it is already committed". It is
+built through a private index file and `git commit-tree`, so nothing in the project changes;
+later snapshots chain onto the previous one through a local `refs/ach/snapshot/<branch>`
+ref, which means the destination gets a clean linear history of code-only commits that still
+fast-forwards without ever forcing.
+
+Both modes share every other gate: destination verification, digest approval, manifest
+re-verification, the tree-equals-manifest check, divergence refusal and failure recovery.
+
+A tracked path is necessarily in a project's history, so `--deny` combines with the mode:
+under `history` a denied-but-committed path refuses the plan; under `snapshot` it is simply
+absent from the destination, because no history is uploaded.
+
 ## The gates
 
 1. **Read-only first.** `source-inspect` never stages, commits, moves or deletes anything. It

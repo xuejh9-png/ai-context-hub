@@ -263,9 +263,10 @@ def make_project(root: Path, slug: str, name: str) -> None:
 # Git helpers
 # ---------------------------------------------------------------------------
 
-def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_git(root: Path, *args: str, check: bool = True,
+            env: dict | None = None) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(["git", "-C", str(root), *args], text=True, encoding="utf-8",
-                            errors="surrogateescape", capture_output=True, check=False)
+                            errors="surrogateescape", capture_output=True, check=False, env=env)
     if check and result.returncode:
         fail(f"Git command failed: git {' '.join(args)}\n{(result.stderr or result.stdout).strip()}")
     return result
@@ -1501,6 +1502,8 @@ SOURCE_SCAN_BYTES = 262_144
 SOURCE_SCAN_FILES = 2_000
 SOURCE_WORK_FILES = (SOURCE_PLAN_FILE, SOURCE_MANIFEST_FILE, SOURCE_RESULT_FILE,
                      SOURCE_VERIFY_FILE, SOURCE_ACCESS_FILE)
+SOURCE_MODES = ("history", "snapshot")
+SOURCE_SNAPSHOT_REF = "refs/ach/snapshot/"
 SOURCE_TOOL_STATUS = ("verified", "pending", "blocked")
 DEFAULT_SOURCE_IGNORE = frozenset((
     ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules", "__pycache__",
@@ -1906,14 +1909,49 @@ def build_manifest(project: Path, decided) -> tuple[str, str]:
     return body, sha256_text(body)
 
 
+def snapshot_commit(project: Path, entries, message: str, branch: str) -> str:
+    """Build a commit containing exactly the manifest, without touching the working tree.
+
+    A private index file is used, so the project's own index, branches, reflog and files are
+    never modified. Later snapshots chain onto the previous snapshot through a local ref, so
+    the destination receives a clean linear history of code-only commits that never contains
+    anything the project's own Git history holds.
+    """
+    paths = [rel for rel, _size, _digest in entries]
+    holder = Path(tempfile.mkdtemp(prefix="ach-snapshot-"))
+    index = holder / "index"
+    environment = dict(os.environ)
+    environment["GIT_INDEX_FILE"] = str(index)
+    try:
+        run_git(project, "read-tree", "--empty", env=environment)
+        for start in range(0, len(paths), 200):
+            run_git(project, "add", "--", *paths[start:start + 200], env=environment)
+        tree = run_git(project, "write-tree", env=environment).stdout.strip()
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+    if not tree:
+        fail("Could not build a tree for the approved manifest.")
+    reference = f"{SOURCE_SNAPSHOT_REF}{branch}"
+    previous = run_git(project, "rev-parse", "--verify", "--quiet", reference,
+                       check=False).stdout.strip()
+    args = ["commit-tree", tree, "-m", message] + (["-p", previous] if previous else [])
+    sha = run_git(project, *args).stdout.strip()
+    if not CODE_SHA.fullmatch(sha):
+        fail("Could not create the snapshot commit.")
+    run_git(project, "update-ref", reference, sha)
+    return sha
+
+
 def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize: str,
                 statement: str, includes: tuple[str, ...], allow_review: tuple[str, ...],
                 branch: str = "", api_probe=None, remote_probe=None,
-                deny: tuple[str, ...] = ()) -> tuple[Path, str]:
+                deny: tuple[str, ...] = (), mode: str = "history") -> tuple[Path, str]:
     project = project.expanduser().resolve()
     slug = check_slug(slug, "project slug")
     authorize = one_line(authorize, "--authorize")
     statement = one_line(statement, "--statement")
+    if mode not in SOURCE_MODES:
+        fail(f"--mode must be one of: {', '.join(SOURCE_MODES)}")
     workdir = require_external_workdir(project, workdir)
     if (workdir / SOURCE_PLAN_FILE).exists():
         fail(f"{SOURCE_PLAN_FILE} already exists in the work directory. Use a fresh directory for a "
@@ -1935,12 +1973,12 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
         listing = "; ".join(f"{rel} ({reason})" for rel, reason in info["hard"][:5])
         fail(f"Refusing to plan: {len(info['hard'])} hard-denied file(s) are selected for upload. "
              f"Remove or ignore them first: {listing}")
-    if history:
+    if history and mode == "history":
         listing = "; ".join(f"{rel} ({reason})" for rel, reason in history[:5])
         fail(f"Refusing to plan: {len(history)} denied path(s) exist in this project's Git history, "
              "so pushing that history would upload them too. Excluding a path here does not remove "
              "it from history, and this tool never rewrites history. Either upload without that "
-             f"policy, or rewrite the history yourself first: {listing}")
+             f"policy, use --mode snapshot, or rewrite the history yourself first: {listing}")
 
     promoted, remaining = [], []
     for rel, reason, size in info["review"]:
@@ -1971,17 +2009,28 @@ def source_plan(project: Path, slug: str, dest: str, workdir: Path, *, authorize
     init_note = "the project is not a Git repository, so the approved first upload will run " \
                 f"`git init -b {branch}` inside it (nothing is deleted or rewritten)" \
         if not (project / ".git").is_dir() else \
-        f"the existing Git repository and its history are reused; no git init, no remote rewrite"
+        "the existing Git repository is reused and is not modified"
+    if mode == "snapshot":
+        git_note = ("mode=snapshot: the destination receives one commit containing exactly the "
+                    "approved files. The project's own history, branches, index, reflog and working "
+                    "tree are NOT modified and are NOT uploaded, so nothing from the project's Git "
+                    "history reaches the destination.")
+    else:
+        git_note = (f"mode=history: {init_note}; the project's existing commits are published as-is, "
+                    "so anything present in that history becomes visible in the destination.")
     plan = (
         f"# Source onboarding plan — {slug}\n\n"
         f"- Project slug: {slug}\n- Local project path: {project}\n- Destination: {dest.strip()}\n"
-        f"- Destination check: {detail}\n- Branch: {branch}\n- Planned (UTC): {stamp()}\n"
+        f"- Destination check: {detail}\n- Branch: {branch}\n- Mode: {mode}\n"
+        f"- Planned (UTC): {stamp()}\n"
         f"- Authorized by: {authorize}\n- Authorization statement: {statement}\n"
         f"- Files approved: {len(entries)}\n- Total bytes: {total} ({human_bytes(total)})\n"
         f"- Manifest SHA-256: {digest}\n"
-        f"- Git handling: {init_note}\n"
+        f"- Git handling: {git_note}\n"
         f"- Owner-declared deny patterns (--deny): {', '.join(deny) or 'none'}\n"
-        f"- Excluded by those patterns: {len(info.get('policy', []))}\n\n"
+        f"- Excluded by those patterns: {len(info.get('policy', []))}\n"
+        f"- Denied paths found in Git history: {len(history)}"
+        + (" (not published in snapshot mode)" if mode == "snapshot" and history else "") + "\n\n"
         "## Hard rules applied to this selection\n\n"
         "- Environment files, key material, databases and credential patterns are refused, not "
         "merely excluded, and cannot be overridden.\n"
@@ -2028,7 +2077,8 @@ def read_plan(workdir: Path) -> dict:
              f"{SOURCE_MANIFEST_FILE}). Run source-plan first.")
     plan = read_safe(plan_path)
     fields = parse_fields(plan, ("- Project slug:", "- Local project path:", "- Destination:",
-                                 "- Branch:", "- Manifest SHA-256:", "- Authorized by:"))
+                                 "- Branch:", "- Manifest SHA-256:", "- Authorized by:",
+                                 "- Mode:"))
     for key in ("- Project slug:", "- Local project path:", "- Destination:", "- Branch:",
                 "- Manifest SHA-256:"):
         if not fields.get(key):
@@ -2066,6 +2116,9 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
     dest = fields["- Destination:"].strip("` ")
     branch = fields["- Branch:"].strip("` ")
     slug = fields["- Project slug:"].strip("` ")
+    mode = fields["- Mode:"].strip() if fields.get("- Mode:") else "history"
+    if mode not in SOURCE_MODES:
+        fail(f"The plan records an unknown mode: {mode!r}")
     check_slug(slug, "project slug")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,120}", branch):
         fail(f"Unsafe branch name in the plan: {branch}")
@@ -2096,7 +2149,7 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
         current = run_git(project, "branch", "--show-current", check=False).stdout.strip()
         if not current:
             fail("The project is on a detached HEAD. Check out a named branch before publishing.")
-        if current != branch:
+        if mode == "history" and current != branch:
             exists = run_git(project, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
                              check=False).returncode == 0
             if not exists:
@@ -2106,17 +2159,6 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
     require_git_identity(project)
 
     manifest_set = {rel for rel, _size, _digest in record["entries"]}
-    unrelated = []
-    for entry in (item for item in run_git(project, "status", "--porcelain", "-z",
-                                          "--untracked-files=all").stdout.split("\0") if item):
-        status, path = entry[:2], entry[3:]
-        if status == "??":
-            continue  # untracked files are never committed by an explicit-path commit
-        if path not in manifest_set:
-            unrelated.append(entry)
-    if unrelated:
-        fail("The project has tracked changes outside the approved manifest. Nothing was staged or "
-             "committed. Commit or stash them first: " + "; ".join(unrelated[:5]))
 
     existing = run_git(project, "remote", "get-url", remote_name, check=False)
     if existing.returncode == 0:
@@ -2133,48 +2175,89 @@ def source_publish(workdir: Path, *, approve_manifest: str, message: str,
                                 branch, check=False).returncode == 0
     if remote_has_branch:
         run_git(project, "fetch", remote_name, branch, check=False)
-        if run_git(project, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD",
-                   check=False).returncode != 0:
+
+    if mode == "snapshot":
+        # Publish exactly the approved files as one commit. The project's own branches, index,
+        # reflog, working tree and history are never touched or uploaded.
+        sha = snapshot_commit(project, record["entries"], message, branch)
+        if remote_has_branch and run_git(project, "merge-base", "--is-ancestor", "FETCH_HEAD", sha,
+                                        check=False).returncode != 0:
+            fail(f"Divergent remote: {remote_name}/{branch} already holds commits that are not part "
+                 "of this snapshot chain. Refusing to force-push. Nothing was pushed.")
+        pushed = run_git(project, "push", remote_name, f"{sha}:refs/heads/{branch}", check=False)
+        if pushed.returncode:
+            detail = (pushed.stderr or pushed.stdout).strip().splitlines()
+            fail("Push failed. The snapshot commit and every working file are preserved; fix access "
+                 "and rerun the same command. Git said: "
+                 + (detail[-1] if detail else "no output"))
+        head_files = {item for item in run_git(project, "ls-tree", "-r", "--name-only", "-z", sha)
+                      .stdout.split("\0") if item}
+        extra = sorted(head_files - manifest_set)
+        absent = sorted(manifest_set - head_files)
+        if extra or absent:
+            fail(f"Internal check failed: the snapshot does not match the approved manifest "
+                 f"({len(extra)} extra, {len(absent)} missing). Investigate before trusting it.")
+        print(f"SNAPSHOT COMMIT: {sha} (project history untouched; "
+              f"{len(head_files)} files published)")
+        print(f"Local branch/uncommitted state unchanged: "
+              f"{run_git(project, 'rev-parse', '--short', 'HEAD', check=False).stdout.strip() or '(none)'}"
+              f" on {run_git(project, 'branch', '--show-current', check=False).stdout.strip() or '(detached)'}")
+    else:
+        unrelated = []
+        for entry in (item for item in run_git(project, "status", "--porcelain", "-z",
+                                              "--untracked-files=all").stdout.split("\0") if item):
+            status, path = entry[:2], entry[3:]
+            if status == "??":
+                continue  # untracked files are never committed by an explicit-path commit
+            if path not in manifest_set:
+                unrelated.append(entry)
+        if unrelated:
+            fail("The project has tracked changes outside the approved manifest. Nothing was staged "
+                 "or committed. Commit or stash them first: " + "; ".join(unrelated[:5]))
+
+        if remote_has_branch and run_git(project, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD",
+                                        check=False).returncode != 0:
             fail(f"Divergent remote: {remote_name}/{branch} already contains commits that are not "
                  "ancestors of the local HEAD. Refusing to force-push or to merge automatically; "
                  "nothing was staged. Reconcile the two histories deliberately, then rerun.")
 
-    for start in range(0, len(record["entries"]), 100):
-        batch = [rel for rel, _size, _digest in record["entries"][start:start + 100]]
-        run_git(project, "add", "--", *batch)
+        for start in range(0, len(record["entries"]), 100):
+            batch = [rel for rel, _size, _digest in record["entries"][start:start + 100]]
+            run_git(project, "add", "--", *batch)
 
-    staged = [line for line in run_git(project, "diff", "--cached", "--name-only").stdout.splitlines()
-              if line]
-    head_ok = run_git(project, "rev-parse", "HEAD", check=False).returncode == 0
-    if staged:
-        run_git(project, "commit", "-q", "-m", message,
-                "--", *[rel for rel, _size, _digest in record["entries"]])
-    elif head_ok:
-        print("Nothing new to commit from the approved manifest; retrying the push of the existing "
-              "commit (no duplicate commit will be created).")
-    else:
-        fail("No commit exists and the approved manifest produced no staged change; nothing to push.")
-    sha = run_git(project, "rev-parse", "HEAD").stdout.strip()
+        staged = [line for line in run_git(project, "diff", "--cached",
+                                          "--name-only").stdout.splitlines() if line]
+        head_ok = run_git(project, "rev-parse", "HEAD", check=False).returncode == 0
+        if staged:
+            run_git(project, "commit", "-q", "-m", message,
+                    "--", *[rel for rel, _size, _digest in record["entries"]])
+        elif head_ok:
+            print("Nothing new to commit from the approved manifest; retrying the push of the "
+                  "existing commit (no duplicate commit will be created).")
+        else:
+            fail("No commit exists and the approved manifest produced no staged change; "
+                 "nothing to push.")
+        sha = run_git(project, "rev-parse", "HEAD").stdout.strip()
 
-    # The pushed tree — not the manifest — is what actually becomes public, so the two must match.
-    head_files = {item for item in run_git(project, "ls-tree", "-r", "--name-only", "-z", sha)
-                  .stdout.split("\0") if item}
-    extra = sorted(head_files - manifest_set)
-    absent = sorted(manifest_set - head_files)
-    if extra or absent:
-        fail(f"Refusing to push: the commit to be uploaded does not match the approved manifest "
-             f"({len(extra)} unapproved tracked file(s), {len(absent)} approved file(s) missing). "
-             + (f"Unapproved but present: {', '.join(extra[:8])}. " if extra else "")
-             + (f"Approved but absent from the commit: {', '.join(absent[:8])}. " if absent else "")
-             + "Remove them from the repository deliberately, or re-plan to include them. "
-               "Nothing was pushed.")
+        # The pushed tree — not the manifest — is what actually becomes visible, so they must match.
+        head_files = {item for item in run_git(project, "ls-tree", "-r", "--name-only", "-z", sha)
+                      .stdout.split("\0") if item}
+        extra = sorted(head_files - manifest_set)
+        absent = sorted(manifest_set - head_files)
+        if extra or absent:
+            fail(f"Refusing to push: the commit to be uploaded does not match the approved manifest "
+                 f"({len(extra)} unapproved tracked file(s), {len(absent)} approved file(s) missing). "
+                 + (f"Unapproved but present: {', '.join(extra[:8])}. " if extra else "")
+                 + (f"Approved but absent from the commit: {', '.join(absent[:8])}. " if absent else "")
+                 + "Remove them from the repository deliberately, or re-plan to include them. "
+                   "Nothing was pushed.")
 
-    pushed = run_git(project, "push", remote_name, f"HEAD:refs/heads/{branch}", check=False)
-    if pushed.returncode:
-        detail = (pushed.stderr or pushed.stdout).strip().splitlines()
-        fail("Push failed. The local commit and all working files are preserved; fix access and rerun "
-             "the same command (no duplicate commit will be created). Git said: "
-             + (detail[-1] if detail else "no output"))
+        pushed = run_git(project, "push", remote_name, f"HEAD:refs/heads/{branch}", check=False)
+        if pushed.returncode:
+            detail = (pushed.stderr or pushed.stdout).strip().splitlines()
+            fail("Push failed. The local commit and every working file are preserved; fix access and "
+                 "rerun the same command (no duplicate commit will be created). Git said: "
+                 + (detail[-1] if detail else "no output"))
 
     result = (f"# Source publish result — {slug}\n\n"
               f"- Local project path: {project}\n- Destination: {dest}\n- Branch: {branch}\n"
@@ -2454,6 +2537,10 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--statement", required=True, help="Authorization statement")
     sp.add_argument("--branch", default="",
                     help="Target branch; defaults to the project's current branch (or main)")
+    sp.add_argument("--mode", default="history", choices=SOURCE_MODES,
+                    help="history: publish the project's existing commits. "
+                         "snapshot: publish one commit containing only the approved files, "
+                         "without modifying or uploading the project's own history.")
     sp.add_argument("--include", action="append", default=[])
     sp.add_argument("--deny", action="append", default=[],
                     help="Owner policy glob that must never be uploaded (repeatable)")
@@ -2547,7 +2634,7 @@ def main(argv: list[str] | None = None) -> int:
             source_plan(source_project_path(args.path), args.project, args.dest,
                         Path(args.workdir), authorize=args.authorize, statement=args.statement,
                         includes=tuple(args.include), allow_review=tuple(args.allow_review),
-                        branch=args.branch, deny=tuple(args.deny))
+                        branch=args.branch, deny=tuple(args.deny), mode=args.mode)
         elif args.command == "source-publish":
             source_publish(Path(args.workdir), approve_manifest=args.approve_manifest,
                            message=args.message)

@@ -171,8 +171,11 @@ python .../ach.py source-plan \
     --path "$HOME/Desktop/Some Project" --project some-project \
     --dest git@github.com:you/some-project.git \
     --workdir ~/source-onboarding/some-project \
+    --mode snapshot --deny 'artifacts/*' \
     --authorize "<you>" --statement "Approved: first upload of the reviewed file list"
 # -> prints the digest of the exact file list in SOURCE_MANIFEST.txt
+#    --mode snapshot publishes ONE commit with only these files and never uploads the
+#    project's own history; --mode history (default) publishes the existing commits
 
 # 3. Read the manifest, then approve that digest
 python .../ach.py source-publish --workdir ~/source-onboarding/some-project \

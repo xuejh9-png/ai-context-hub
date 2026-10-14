@@ -488,6 +488,103 @@ class SourcePublishTests(SourceFixture):
         self.assertIn("Run source-publish first", str(caught.exception))
 
 
+class SourceSnapshotTests(SourceFixture):
+    """--mode snapshot publishes only the approved files and never touches local history."""
+
+    def snapshot_plan(self, project: Path, dest, *, work, deny=(), branch="main"):
+        _, digest = ach.source_plan(project, "demo", str(dest), work, authorize="demo-owner",
+                                   statement="approved: publish only these files",
+                                   includes=(), allow_review=(), branch=branch,
+                                   deny=deny, mode="snapshot")
+        return digest
+
+    def test_snapshot_publishes_only_the_approved_files(self):
+        project = self.make_git_project(extra_files={"artifacts/shot-01.png": b"PK\x03\x04data"})
+        self.commit_all(project)
+        remote = self.make_remote()
+        head_before = self.git(project, "rev-parse", "HEAD")
+        status_before = self.git(project, "status", "--porcelain")
+        count_before = self.git(project, "rev-list", "--count", "HEAD")
+
+        digest = self.snapshot_plan(project, remote, work=self.work, deny=("artifacts/*",))
+        manifest = (self.work / ach.SOURCE_MANIFEST_FILE).read_text(encoding="utf-8")
+        self.assertNotIn("artifacts/shot-01.png", manifest)
+        ach.source_publish(self.work, approve_manifest=digest, message="Snapshot upload")
+
+        published = self.remote_files(remote)
+        self.assertIn("src/main.py", published)
+        self.assertNotIn("artifacts/shot-01.png", published)
+        self.assertEqual("1", self.remote_count(remote))
+        # The snapshot is a root commit: it carries no ancestor history.
+        self.assertEqual("", self.git(remote, "log", "-1", "--format=%P", "main"))
+
+    def test_snapshot_does_not_modify_the_local_repository(self):
+        project = self.make_git_project()
+        self.commit_all(project)
+        remote = self.make_remote()
+        before = {
+            "head": self.git(project, "rev-parse", "HEAD"),
+            "branch": self.git(project, "branch", "--show-current"),
+            "status": self.git(project, "status", "--porcelain"),
+            "count": self.git(project, "rev-list", "--count", "HEAD"),
+        }
+        work = self.work
+        digest = ach.source_plan(project, "demo", str(remote), work, authorize="demo-owner",
+                                 statement="approved", includes=(), allow_review=(),
+                                 branch="main", mode="snapshot")[1]
+        ach.source_publish(work, approve_manifest=digest, message="Snapshot upload")
+        after = {
+            "head": self.git(project, "rev-parse", "HEAD"),
+            "branch": self.git(project, "branch", "--show-current"),
+            "status": self.git(project, "status", "--porcelain"),
+            "count": self.git(project, "rev-list", "--count", "HEAD"),
+        }
+        self.assertEqual(before, after)
+
+    def test_snapshot_chain_fast_forwards_without_force(self):
+        project = self.make_git_project()
+        self.commit_all(project)
+        remote = self.make_remote()
+        first = ach.source_plan(project, "demo", str(remote), self.work, authorize="demo-owner",
+                                statement="approved", includes=(), allow_review=(),
+                                branch="main", mode="snapshot")[1]
+        ach.source_publish(self.work, approve_manifest=first, message="Snapshot one")
+        first_sha = self.remote_head(remote)
+
+        second_work = self.root / "work-two"
+        second_work.mkdir()
+        (project / "src" / "extra.py").write_text("EXTRA = 1\n", encoding="utf-8")
+        self.commit_all(project, "add extra")
+        second = ach.source_plan(project, "demo", str(remote), second_work, authorize="demo-owner",
+                                 statement="approved", includes=(), allow_review=(),
+                                 branch="main", mode="snapshot")[1]
+        ach.source_publish(second_work, approve_manifest=second, message="Snapshot two")
+        self.assertNotEqual(first_sha, self.remote_head(remote))
+        self.assertEqual("2", self.remote_count(remote))
+        self.assertEqual(first_sha, self.git(remote, "log", "-1", "--format=%P", "main"))
+        self.assertIn("src/extra.py", self.remote_files(remote))
+
+    def test_snapshot_refuses_a_divergent_remote(self):
+        project = self.make_git_project()
+        self.commit_all(project)
+        remote = self.make_remote()
+        seeder = self.root / "seeder"
+        self.git(self.root, "clone", str(remote), str(seeder))
+        self.git(seeder, "config", "user.name", "Seeder")
+        self.git(seeder, "config", "user.email", "seed@example.invalid")
+        (seeder / "other.txt").write_text("unrelated\n", encoding="utf-8")
+        self.commit_all(seeder, "seed")
+        self.git(seeder, "push", "-q", "origin", "main")
+        before = self.remote_head(remote)
+        digest = ach.source_plan(project, "demo", str(remote), self.work, authorize="demo-owner",
+                                 statement="approved", includes=(), allow_review=(),
+                                 branch="main", mode="snapshot")[1]
+        with self.assertRaises(ach.HubError) as caught:
+            ach.source_publish(self.work, approve_manifest=digest, message="Snapshot")
+        self.assertIn("Divergent remote", str(caught.exception))
+        self.assertEqual(before, self.remote_head(remote))
+
+
 class SourceAccessTests(SourceFixture):
     def test_third_party_read_is_kept_separate_from_our_own_readback(self):
         project = self.make_git_project()
