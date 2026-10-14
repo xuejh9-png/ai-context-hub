@@ -1,12 +1,45 @@
 # AI Context Hub
 
-**v0.1.0 — Git-backed, on-demand project context sharing for multiple AI tools**
+**Project context that travels across AI tools — without a new agent server.**
 
-[中文使用指南](docs/DEPLOYMENT_ZH.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](docs/SECURITY.md)
+*跨 AI 的项目上下文共享与可验证交接，而不是另一个聊天机器人。*
 
-AI Context Hub lets different AI tools read the same project context and publish traceable handoffs **when instructed**. Its storage is ordinary UTF-8 Markdown in a private Git repository; GitHub is the recommended host, but any compatible Git remote works.
+**v0.1.0 · Git + Markdown · On-demand · Python 3.10+ · No model API required**
 
-**It does NOT** automatically intercept ChatGPT/WorkBuddy/Codex conversations, stream their hidden states, run an agent server, or certify an implementation solely from another agent's report.
+[中文：项目背景、痛点与价值](docs/WHY_IT_EXISTS_ZH.md) · [中文部署指南](docs/DEPLOYMENT_ZH.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](docs/SECURITY.md)
+
+## Why this project exists
+
+Working with multiple AI tools introduces a coordination problem: **the work may move between tools, but project context and evidence do not reliably move with it.** Chat sharing links are not general-purpose conversation APIs, and manually pasting long chats leads to stale context, repeated explanations, lost decisions, and unverifiable claims of completion.
+
+AI Context Hub solves a narrower, practical problem: **on request, each authorized agent can read the same project record and publish an attributable handoff that another agent can inspect and verify.**
+
+| Pain point | What the hub provides |
+| --- | --- |
+| Conversations are isolated across AI apps | Shared, tool-neutral Markdown project context |
+| Re-explaining background at every handoff | On-demand access to goals, constraints, decisions, current status, and recent handoffs |
+| "Agent A says it is done" is not evidence | Named handoffs with evidence fields, timestamps and Git commit history |
+| Agent updates can collide or be lost | Unique append-only handoff files, guarded Git sync and explicit conflict handling |
+| A full agent orchestration platform is overkill | CLI built with the Python standard library + Git; no server, database or extra model API |
+
+### Example: a multi-agent software project
+
+1. A human and a planning AI agree on the scope and record the approved decisions.
+2. An implementation agent reads the latest context, makes changes **in the separate application repository**, then writes a factual handoff with test evidence.
+3. A reviewer agent reads the same context and the previous handoff, checks the implementation independently and publishes a second review record.
+4. The planning AI reads both records from the private context repository to continue the discussion without relying on copied chat history.
+
+**The original application source and runtime tests remain the authority for whether a feature actually works.** This tool provides coordination and traceability, not proof-by-self-report.
+
+### What it deliberately does not do
+
+- No automatic capture or mirroring of complete ChatGPT, Codex, WorkBuddy, or other chat sessions.
+- No live shared model memory, hidden-state access, autonomous task scheduling, or always-on agents.
+- No guarantee that every AI tool has read/write access: credentials and permissions must be configured and verified per tool.
+- No promise of lower token spend, faster delivery, or fewer bugs without measuring those outcomes in real workflows.
+- No complete secret-scanning guarantee; humans must review what is uploaded to any remote, including a private one.
+
+See the [Chinese project story and problem/solution guide](docs/WHY_IT_EXISTS_ZH.md) for the product rationale, practical workflow, system boundaries, and acceptance criteria.
 
 ## Architecture
 
@@ -96,6 +129,6 @@ Tests include a local bare Git remote with two independent agent clones and conc
 
 ## Release status
 
-Local MVP and tests available. GitHub remote creation, authorized multi-tool read/write and real private-project end-to-end tests require separate verification. The public package contains no real private project records.
+v0.1.0 has been published as a standalone public tool. A private-repository handoff was exercised across separate WorkBuddy and Codex runs and independently read through ChatGPT's authorized GitHub connector; this validates the **on-demand record-sharing path** for that particular environment, not automatic cross-platform chat synchronization. GitHub Actions checks the maintained Python test matrix. Other installations still need their own credential, read/write, and readback verification. The public package contains no private project records.
 
 License: **not yet chosen**; ask the repository owner before external redistribution or open-source licensing.
