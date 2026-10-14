@@ -52,6 +52,20 @@ The default `read` is local; `read --sync` first fetches and fast-forwards to th
 
 `sync-push` accepts **only newly created handoff Markdown files**. It refuses unrelated or tracked file changes. Decisions and status updates require separate, explicitly reviewed commits/PRs, avoiding agent overwrite of shared decisions. Concurrent independent handoffs are supported through unique filenames and guarded Git pushes. No forced pushes.
 
+Configure a Git author name and email in each clone before publishing. `sync-push`
+checks author/committer identity before staging. If signing or a commit hook fails,
+it unstages only the attempted logs and leaves their files intact. If a push fails,
+logs remain committed locally: fix the connection/permissions and rerun the same
+command. It checks every unpublished commit and refuses unrelated changes,
+existing-log edits, unsafe files and detected credentials before pushing.
+
+Concurrent updates from separate clones append a merge commit without rewriting
+either handoff commit. A filename collision stops for manual review, even when
+the contents match. `sync-pull` and `sync-push` share a per-checkout lock;
+use separate clones for separate agents and do not run external Git mutations
+during a sync. After a process crash, inspect `.git/ach-sync.lock` and confirm no
+sync is running before manually removing a stale lock. No automatic lock stealing.
+
 ## Commands
 
 | Command | Effect |

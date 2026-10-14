@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import os
 import re
@@ -106,10 +107,11 @@ def require_clean_for_pull(root: Path) -> None:
 
 def pull(root: Path) -> None:
     branch = git_ready(root)
-    require_clean_for_pull(root)
-    run_git(root, "fetch", "origin", branch)
-    run_git(root, "merge", "--ff-only", "FETCH_HEAD")
-    print(f"Synced to origin/{branch} at {run_git(root, 'rev-parse', '--short', 'HEAD').stdout.strip()}")
+    with sync_lock(root):
+        require_clean_for_pull(root)
+        run_git(root, "fetch", "origin", branch)
+        run_git(root, "merge", "--ff-only", "FETCH_HEAD")
+        print(f"Synced to origin/{branch} at {run_git(root, 'rev-parse', '--short', 'HEAD').stdout.strip()}")
 
 
 def render_context(root: Path, slug: str, last: int) -> str:
@@ -183,39 +185,117 @@ def validate(root: Path, slug: str) -> int:
     return 0
 
 
+@contextlib.contextmanager
+def sync_lock(root: Path):
+    lock = root / run_git(root, "rev-parse", "--git-path", "ach-sync.lock").stdout.strip()
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        fail("Another sync owns ach-sync.lock. Retry after it finishes; inspect stale locks manually.")
+    try:
+        os.close(descriptor)
+        yield
+    finally:
+        lock.unlink()
+
+
+def pending_handoffs(root: Path, prefix: str) -> set[str]:
+    """Check every unpublished commit, including content hidden by later edits."""
+    paths = set()
+    commits = run_git(root, "rev-list", "FETCH_HEAD..HEAD").stdout.splitlines()
+    for commit in commits:
+        parents = run_git(root, "rev-list", "--parents", "-n", "1", commit).stdout.split()
+        changes = run_git(root, "diff-tree", "--root", "--no-commit-id", "--no-renames",
+                          "--name-status", "-r", "-z", *(["--cc"] if len(parents) > 2 else []),
+                          commit).stdout.rstrip("\0").split("\0")
+        if changes == [""]:
+            continue
+        # A merge may incorporate approved remote changes, but must not resolve/edit files.
+        if len(parents) > 2:
+            fail("Unreviewed merge resolution in unpublished history. Review manually.")
+        for status, path in zip(changes[::2], changes[1::2]):
+            if status != "A" or not is_handoff(path, prefix):
+                fail("Unrelated or modified unpublished history detected. No changes pushed.")
+            mode = run_git(root, "ls-tree", commit, "--", path).stdout.split()[0]
+            if mode not in ("100644", "100755"):
+                fail("Unsafe handoff in unpublished history.")
+            size = int(run_git(root, "cat-file", "-s", f"{commit}:{path}").stdout)
+            if size > MAX_FILE:
+                fail("Handoff too large in unpublished history.")
+            check_secrets(run_git(root, "show", f"{commit}:{path}").stdout)
+            paths.add(path)
+    return paths
+
+
+def is_handoff(path: str, prefix: str) -> bool:
+    name = path.removeprefix(prefix)
+    return (path.startswith(prefix) and "/" not in name and name.endswith(".md")
+            and name != "README.md")
+
+
 def sync_push(root: Path, slug: str) -> None:
-    # Only untracked unique handoff files are committed. Shared mutable files need manual review/PR.
+    git_ready(root)
+    with sync_lock(root):
+        _sync_push(root, slug)
+
+
+def _sync_push(root: Path, slug: str) -> None:
     branch = git_ready(root)
     require_clean_for_pull(root)
     prefix = f"projects/{check_slug(slug, 'project')}/handoffs/"
-    porcelain = run_git(root, "status", "--porcelain", "--untracked-files=all").stdout.splitlines()
+    porcelain = run_git(root, "status", "--porcelain", "-z", "--untracked-files=all").stdout.split("\0")
+    porcelain = [line for line in porcelain if line]
     unexpected = [line for line in porcelain if not (line.startswith("?? ") and
-                  line[3:].startswith(prefix) and line[3:].endswith(".md"))]
+                  is_handoff(line[3:], prefix))]
     if unexpected:
         fail("Unrelated or modified files detected. No changes pushed: " + "; ".join(unexpected[:5]))
     paths = [line[3:] for line in porcelain]
-    if not paths:
-        print("No new handoffs to push.")
-        return
     for path in paths:
         check_secrets(read_safe(root / path))
-    # Fast-forward remote updates before committing local handoffs.
-    pull(root)
-    run_git(root, "add", "--", *paths)
-    run_git(root, "commit", "-m", f"handoff({slug}): add {len(paths)} independent log(s)")
+    run_git(root, "fetch", "origin", branch)
+    pending = pending_handoffs(root, prefix)
+    if paths or pending:
+        # Check both identities BEFORE staging; signing/hooks can still fail below.
+        run_git(root, "var", "GIT_AUTHOR_IDENT")
+        run_git(root, "var", "GIT_COMMITTER_IDENT")
+    integrate_remote(root, pending | set(paths))
+    if paths:
+        try:
+            run_git(root, "add", "--", *paths)
+            run_git(root, "commit", "--only", "-m",
+                    f"handoff({slug}): add {len(paths)} independent log(s)", "--", *paths)
+        except HubError:
+            # The index started clean. Unstage only our files; retain working bytes.
+            run_git(root, "restore", "--staged", "--", *paths)
+            raise
+    if not paths and not pending:
+        print("No new or pending handoffs to push.")
+        return
     for attempt in range(3):
+        require_clean_for_pull(root)
+        pending = pending_handoffs(root, prefix)
         pushed = run_git(root, "push", "origin", f"HEAD:{branch}", check=False)
         if pushed.returncode == 0:
             print("PUSHED:", run_git(root, "rev-parse", "HEAD").stdout.strip())
             return
         if attempt == 2:
-            fail("Push rejected after 3 attempts; inspect remote and local history. No force push used.")
-        # Rebase only our just-created commit(s) on a newer remote tip.
+            fail("Push rejected after 3 attempts; handoffs remain committed locally. "
+                 "Fix connectivity/permissions and rerun sync-push. No force push used.")
         run_git(root, "fetch", "origin", branch)
-        rebased = run_git(root, "rebase", "FETCH_HEAD", check=False)
-        if rebased.returncode:
-            run_git(root, "rebase", "--abort", check=False)
-            fail("Concurrent edit conflict: rebase aborted; no data overwritten. Resolve manually.")
+        integrate_remote(root, pending)
+
+
+def integrate_remote(root: Path, local_paths: set[str]) -> None:
+    base = run_git(root, "merge-base", "HEAD", "FETCH_HEAD").stdout.strip()
+    remote_paths = set(run_git(root, "diff", "--name-only", "-z", base, "FETCH_HEAD")
+                       .stdout.rstrip("\0").split("\0"))
+    if local_paths & remote_paths:
+        fail("Concurrent handoff filename conflict. Local files/commits retained; review manually.")
+    # Append a merge for independent histories; never rewrite/drop the local log commit.
+    merged = run_git(root, "merge", "--no-edit", "FETCH_HEAD", check=False)
+    if merged.returncode:
+        run_git(root, "merge", "--abort", check=False)
+        fail("Remote integration failed. Local handoffs retained; resolve manually.")
 
 
 def main(argv: list[str] | None = None) -> int:
