@@ -21,7 +21,7 @@ my-ai-context/                     # PRIVATE, not bundled in this public repo
         BRIEF.md                    # Scope, target repo, baseline, approval state
         ACCEPTANCE.md               # Verifiable acceptance criteria
         ASSETS.md                   # SHA-256 manifest of approved images
-        APPROVAL.md                 # Human approval bound to BRIEF.md's hash
+        APPROVAL.md                 # Approval assertion bound to packet-text hashes
         assets/<name>               # Approved evidence images
       uat/<feedback-id>/            # v0.2 append-only defect records
         UAT_FEEDBACK.md             # Tested commit, steps, expected vs observed, status history
@@ -58,12 +58,14 @@ v0.2 keeps that model and adds explicit publication gates rather than a new cont
   intermediate edit cannot hide behind a later "add only" state.
 * Publication compares against the fetched remote: an identical packet is a no-op, a
   divergent one is refused. UAT records may only be appended to.
+* Approval, asset-manifest and UAT-status writes use the same per-checkout lock as
+  publication, preventing two local processes from silently losing one another's update.
 * Git identity, remote reachability and permission are checked before staging, so a failure
   never leaves a half-staged index. No command force-pushes and none deletes published
   history.
 
 An onboarding check exists because access is frequently assumed and rarely proven:
-`onboard-check` observes context read, source-repository read and push permission, and
+`onboard-check --prove-push` observes context read, source-repository read and current push permission, and
 reports `BLOCKED` with the failing layer instead of letting an agent claim a review was
 possible. Whether a specific chat connector can read the repository cannot be observed by
 this CLI and is reported as `UNKNOWN`.
@@ -72,14 +74,28 @@ this CLI and is reported as `UNKNOWN`.
 
 - Context/decision source of truth: the explicitly chosen **private Git remote** after cross-tool verification.
 - Code correctness source of truth: the target application's actual source repo, runtime checks and test evidence.
-- Approved-scope source of truth: the packet's `BRIEF.md` together with its `APPROVAL.md` hash binding; an implementation handoff does not redefine scope.
+- Approved-packet source of truth: `BRIEF.md`, `ACCEPTANCE.md` and `ASSETS.md` together with
+  their `APPROVAL.md` hash bindings; an implementation handoff does not redefine scope.
+
+The approval and UAT actor names are recorded assertions rather than authenticated
+identities. Git hosting permissions and review policy enforce who may publish. The CLI's
+append-only checks operate on ordinary history; remote force-push protection is a hosting
+configuration responsibility.
 - Defect source of truth: the UAT record, which names the exact tested commit rather than an environment description.
 - Previous shared cloud storage: archival/transition source until all consumers confirm the Git remote; not two simultaneous writable authorities.
 
 ## Verified deployment versus roadmap
 
 - **v0.1 (shipped):** project templates, read/handoff/validate, Git sync, failure recovery and two-agent concurrency tests. In one authorized real-world pilot, WorkBuddy and Codex independently submitted private-repository handoffs; ChatGPT independently read back both records with a GitHub connector. This verifies an **on-demand artifact-sharing workflow**, not complete chat mirroring or universal read/write access across every platform.
-- **v0.2 (this change):** approved task packets with a hash-bound human approval, hash-verified image asset handoff, evidence-based completion records, the append-only UAT defect loop, and the fail-closed onboarding check. Covered by automated tests including concurrent handoff/packet publication and existing failure-recovery regressions. The v0.2 workflow has **not** yet been exercised end-to-end by a second tool on a real project.
+- **v0.2 (shipped on a branch, pending review):** approved task packets with a hash-bound human approval, hash-verified image asset handoff, evidence-based completion records, the append-only UAT defect loop, and the fail-closed onboarding check. Covered by automated tests including concurrent handoff/packet publication and existing failure-recovery regressions.
+- **v0.3 (this change):** application-source onboarding. A read-only inspection, a
+  digest-approved file manifest, a non-destructive first upload into a **separate private
+  source repository**, an independent fresh-clone read-back, and a per-tool access record. The
+  three layers (public tool, private context, private source) are now explicitly isolated, and
+  the CLI never writes application code into the context repository or tool code into a source
+  repository. Remote repository creation is deliberately out of scope: it needs account-level
+  authorization the tool does not hold, so it is reported as a setup requirement.
+
 - **Next:** run the manual 3-agent pilot, exercise a real defect round trip, and measure actual time saved and failure rates against a baseline.
 - **Longer term (only if justified):** provider-neutral packaging and better retrieval across growing project archives.
 

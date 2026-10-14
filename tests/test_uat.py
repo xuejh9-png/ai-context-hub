@@ -155,6 +155,8 @@ class UatFeedbackTests(HubFixture):
             f"- Bytes: {extra.stat().st_size}\n- Type: image/png\n"
             "- Origin: retest screenshot\n- Approved by: demo-user\n"
             f"- Added (UTC): {ach.stamp()}\n"))
+        ach.uat_status(self.repo, self.project, feedback, status="reproduced", by="codex",
+                       note="reproduced with added evidence", related_pr=PR_URL)
         ach.uat_status(self.repo, self.project, feedback, status="fixed", by="codex",
                        note="regression fixed", related_pr=PR_URL)
         ach.uat_publish(self.repo, self.project, feedback)
@@ -248,6 +250,8 @@ class HandoffCompletionRecordTests(HubFixture):
                                  "tests pass", "", "review", "VERIFIED",
                                  source_repo="https://example.invalid/demo/app.git",
                                  branch="feat/x", code_sha=CODE_SHA, pr=PR_URL,
+                                 build="python -m unittest discover -s tests -v",
+                                 tests="All synthetic tests passed",
                                  acceptance="PASSED", uat=feedback)
         self.assertIn(f"Human acceptance: PASSED (UAT feedback {feedback})", path.read_text())
 

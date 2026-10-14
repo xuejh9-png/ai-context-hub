@@ -4,9 +4,9 @@
 
 *跨 AI 的项目上下文共享、已批准任务包与 UAT 缺陷闭环，而不是另一个聊天机器人。*
 
-**v0.2.0 · Git + Markdown · On-demand · Python 3.10+ · No model API required**
+**v0.3.0 · Git + Markdown · On-demand · Python 3.10+ · No model API required**
 
-[中文：项目背景、痛点与价值](docs/WHY_IT_EXISTS_ZH.md) · [中文部署指南](docs/DEPLOYMENT_ZH.md) · [Architecture](docs/ARCHITECTURE.md) · [Task packets & UAT](docs/TASK_PACKET.md) · [Security](docs/SECURITY.md) · [3-agent pilot runbook](docs/PILOT_RUNBOOK.md)
+[中文：项目背景、痛点与价值](docs/WHY_IT_EXISTS_ZH.md) · [中文部署指南](docs/DEPLOYMENT_ZH.md) · [Architecture](docs/ARCHITECTURE.md) · [Task packets & UAT](docs/TASK_PACKET.md) · [Source onboarding](docs/SOURCE_ONBOARDING.md) · [Security](docs/SECURITY.md) · [3-agent pilot runbook](docs/PILOT_RUNBOOK.md)
 
 ## Why this project exists
 
@@ -20,7 +20,7 @@ AI Context Hub solves a narrower, practical problem: **on request, each authoriz
 | Re-explaining background at every handoff | On-demand access to goals, constraints, decisions, current status, and recent handoffs |
 | "Agent A says it is done" is not evidence | Named handoffs with evidence fields, timestamps and Git commit history |
 | Agent updates can collide or be lost | Unique append-only handoff files, guarded Git sync and explicit conflict handling |
-| An approved plan quietly drifts while it is being built | An approved packet is bound to the brief's hash; a post-approval edit cannot be published |
+| An approved plan quietly drifts while it is being built | An approved packet binds its brief, acceptance criteria and asset manifest; a post-approval edit cannot be published |
 | A defect report arrives as another ZIP of the source tree | UAT records reference the tested commit and PR, and are readable in place |
 | A full agent orchestration platform is overkill | CLI built with the Python standard library + Git; no server, database or extra model API |
 
@@ -58,7 +58,7 @@ PRIVATE Git repository: my-ai-context
     projects/<id>/handoffs/<unique id>.md  (append-only agent logs)
     projects/<id>/tasks/<task-id>/         (approved implementation packet)
         BRIEF.md  ACCEPTANCE.md  ASSETS.md
-        APPROVAL.md                        binds the approved brief to a SHA-256
+        APPROVAL.md                        binds the approved packet text to SHA-256 hashes
         assets/<approved files>            hash-verified evidence images
     projects/<id>/uat/<feedback-id>/       (append-only UAT defect records)
         UAT_FEEDBACK.md  ASSETS.md  assets/<screenshots>
@@ -102,7 +102,8 @@ existing-log edits, unsafe files and detected credentials before pushing.
 
 Concurrent updates from separate clones append a merge commit without rewriting
 either handoff commit. A filename collision stops for manual review, even when
-the contents match. `sync-pull` and `sync-push` share a per-checkout lock;
+the contents match. Sync/publish commands and the multi-file approval, asset-manifest
+and UAT-status updates share a per-checkout lock;
 use separate clones for separate agents and do not run external Git mutations
 during a sync. After a process crash, inspect `.git/ach-sync.lock` and confirm no
 sync is running before manually removing a stale lock. No automatic lock stealing.
@@ -146,9 +147,65 @@ A published packet can never be overwritten: changing it requires a new task id 
 revision. A published UAT record may only grow — appending a status line or a new
 screenshot is allowed, rewriting or deleting published content fails closed.
 
+Approval and UAT author names are recorded assertions. The CLI preserves and checks them,
+but does not authenticate a human identity. Host access controls, protected branches and
+human review provide that authority. Run `onboard-check --prove-push` for a current write
+test; seeing an older commit on the remote proves read/history only.
+
 The full manual 3-agent pilot (planning AI approves, implementation agent builds,
 reviewer agent verifies, human runs UAT) is in the
 [3-agent pilot runbook](docs/PILOT_RUNBOOK.md).
+
+### v0.3 workflow: existing local project → separate private source repository
+
+This is the step that removes the ZIP. Inspection is read-only; nothing is staged, committed
+or pushed until you approve the exact file list.
+
+```bash
+# 1. Look before touching anything (read-only: writes nothing into the project)
+python .../ach.py source-inspect --path "$HOME/Desktop/Some Project"
+
+# 2. Create the destination PRIVATE repository, then plan the upload
+mkdir -p ~/source-onboarding/some-project
+python .../ach.py source-plan \
+    --path "$HOME/Desktop/Some Project" --project some-project \
+    --dest git@github.com:you/some-project.git \
+    --workdir ~/source-onboarding/some-project \
+    --mode snapshot --deny 'artifacts/*' \
+    --authorize "<you>" --statement "Approved: first upload of the reviewed file list"
+# -> prints one approval digest binding destination, mode, planned HEAD and the exact
+#    file list in SOURCE_MANIFEST.txt
+#    --mode snapshot publishes ONE commit with only these files and never uploads the
+#    project's own history; --mode history (default) publishes the existing commits
+
+# 3. Read the manifest, then approve that digest
+python .../ach.py source-publish --workdir ~/source-onboarding/some-project \
+    --approve-manifest <digest>
+
+# 4. Prove the upload with an independent fresh clone
+python .../ach.py source-verify --workdir ~/source-onboarding/some-project
+
+# 5. Record what each OTHER tool can actually do — never infer it
+python .../ach.py source-access --workdir ~/source-onboarding/some-project \
+    --tool chatgpt --status pending --evidence "connector not yet pointed at the repo"
+# A verified record must include the exact Commit SHA from SOURCE_RESULT.md:
+python .../ach.py source-access --workdir ~/source-onboarding/some-project \
+    --tool codex --status verified --sha <exact-published-commit> \
+    --evidence "independently cloned and read the published commit"
+```
+
+Hard gates: denied file types (`.env`, keys, keystores, databases), credential patterns, and
+denied paths or contents **anywhere in the project's Git history** refuse history mode outright;
+archives, backups and oversized historical blobs also require snapshot mode. A `github.com`
+destination is accepted only when the unauthenticated API returns exactly `404` and authenticated
+Git access succeeds; ambiguous API failures are refused. An existing different `origin` is a hard
+refusal; history mode must still be on the approved branch and HEAD; unrelated history stops
+snapshot publication instead of forcing; and the immutable commit tree must equal the approved
+manifest byte for byte before push.
+
+`source-verify` proves only that **this machine** can push and read back. Until a second tool
+records a verified read with `source-access`, the summary reports
+`VERDICT: sharing NOT VERIFIED`. See [Source onboarding](docs/SOURCE_ONBOARDING.md).
 
 ## Commands
 
@@ -170,6 +227,11 @@ reviewer agent verifies, human runs UAT) is in the
 | `uat-status` | Append a status transition (`reported`/`reproduced`/`fixed`/`re-tested`) |
 | `uat-publish` | Publish a UAT record; published history is append-only |
 | `uat-read` | List or read UAT feedback records with their current status |
+| `source-inspect` | Read-only inspection of a local project before onboarding |
+| `source-plan` | Plan a first upload: exact file list, destination check, owner authorization |
+| `source-publish` | Non-destructive first upload (or later push) of the approved manifest |
+| `source-verify` | Fresh-clone read-back proving the commit SHA and every file byte |
+| `source-access` | Record one other tool's own read access to the source repository |
 
 ## Reliability contract
 
@@ -209,5 +271,13 @@ v0.1.0 published the context and handoff loop. A private-repository handoff was 
 v0.2.0 adds the approved task packet, the hash-verified asset handoff, evidence-based completion records, the UAT defect loop and the fail-closed onboarding check. The local test suite passes on the maintained Python versions (3.10, 3.11, 3.13), and the public package contains no private project records.
 
 The v0.2 workflow has not yet been exercised end-to-end by a second tool on a real project. Each participating tool still needs its own credential, read/write and read-back verification, which `onboard-check` reports honestly instead of assuming.
+
+v0.3.0 adds **application-source repository onboarding** for the gap recorded in issue #4:
+read-only inspection of an existing local project, a manifest the owner approves by digest, a
+non-destructive first upload into a separate private repository, an independent fresh-clone
+read-back, and a per-tool access record that keeps "this machine can read it" separate from
+"another AI tool can read it". Six of the seven acceptance gates from that issue are now
+implemented and covered by tests; remote repository creation still requires the owner's
+account authorization and is reported as a setup requirement rather than assumed.
 
 License: **not yet chosen**; ask the repository owner before external redistribution or open-source licensing.
