@@ -1,0 +1,16 @@
+[project]
+name = "ai-context-hub"
+version = "0.1.0"
+description = "On-demand Git-backed project context sharing across AI tools"
+requires-python = ">=3.10"
+
+[project.scripts]
+ach = "ach:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["ach"]
+package-dir = {"" = "src"}
