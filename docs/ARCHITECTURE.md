@@ -21,7 +21,7 @@ my-ai-context/                     # PRIVATE, not bundled in this public repo
         BRIEF.md                    # Scope, target repo, baseline, approval state
         ACCEPTANCE.md               # Verifiable acceptance criteria
         ASSETS.md                   # SHA-256 manifest of approved images
-        APPROVAL.md                 # Human approval bound to BRIEF.md's hash
+        APPROVAL.md                 # Approval assertion bound to packet-text hashes
         assets/<name>               # Approved evidence images
       uat/<feedback-id>/            # v0.2 append-only defect records
         UAT_FEEDBACK.md             # Tested commit, steps, expected vs observed, status history
@@ -58,12 +58,14 @@ v0.2 keeps that model and adds explicit publication gates rather than a new cont
   intermediate edit cannot hide behind a later "add only" state.
 * Publication compares against the fetched remote: an identical packet is a no-op, a
   divergent one is refused. UAT records may only be appended to.
+* Approval, asset-manifest and UAT-status writes use the same per-checkout lock as
+  publication, preventing two local processes from silently losing one another's update.
 * Git identity, remote reachability and permission are checked before staging, so a failure
   never leaves a half-staged index. No command force-pushes and none deletes published
   history.
 
 An onboarding check exists because access is frequently assumed and rarely proven:
-`onboard-check` observes context read, source-repository read and push permission, and
+`onboard-check --prove-push` observes context read, source-repository read and current push permission, and
 reports `BLOCKED` with the failing layer instead of letting an agent claim a review was
 possible. Whether a specific chat connector can read the repository cannot be observed by
 this CLI and is reported as `UNKNOWN`.
@@ -72,7 +74,13 @@ this CLI and is reported as `UNKNOWN`.
 
 - Context/decision source of truth: the explicitly chosen **private Git remote** after cross-tool verification.
 - Code correctness source of truth: the target application's actual source repo, runtime checks and test evidence.
-- Approved-scope source of truth: the packet's `BRIEF.md` together with its `APPROVAL.md` hash binding; an implementation handoff does not redefine scope.
+- Approved-packet source of truth: `BRIEF.md`, `ACCEPTANCE.md` and `ASSETS.md` together with
+  their `APPROVAL.md` hash bindings; an implementation handoff does not redefine scope.
+
+The approval and UAT actor names are recorded assertions rather than authenticated
+identities. Git hosting permissions and review policy enforce who may publish. The CLI's
+append-only checks operate on ordinary history; remote force-push protection is a hosting
+configuration responsibility.
 - Defect source of truth: the UAT record, which names the exact tested commit rather than an environment description.
 - Previous shared cloud storage: archival/transition source until all consumers confirm the Git remote; not two simultaneous writable authorities.
 

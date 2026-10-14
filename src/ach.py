@@ -36,6 +36,7 @@ MAX_ASSET = 5_000_000
 ASSET_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\.(?:png|jpe?g|gif|webp)$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 CODE_SHA = re.compile(r"^[0-9a-f]{7,40}$")
+UAT_ID = re.compile(r"^[0-9]{8}T[0-9]{12}Z_[a-z0-9][a-z0-9-]{0,63}_[0-9a-f]{10}$")
 HANDOFF_STATUS = ("VERIFIED", "REPORTED_UNVERIFIED", "PROPOSED", "BLOCKED")
 UAT_STATUS = ("reported", "reproduced", "fixed", "re-tested")
 UAT_SEVERITY = ("low", "medium", "high", "critical")
@@ -84,6 +85,19 @@ def check_slug(value: str, kind: str) -> str:
     return value
 
 
+def check_uat_id(value: str) -> str:
+    if not UAT_ID.fullmatch(value):
+        fail("Invalid feedback id; use an id created by uat-new.")
+    return value
+
+
+def one_line(value: str, name: str) -> str:
+    value = value.strip()
+    if not value or "\n" in value or "\r" in value:
+        fail(f"{name} must be one nonempty line.")
+    return value
+
+
 def safe_rel(rel: str) -> bool:
     """Reject absolute, empty, '.' and '..' path components (path traversal guard)."""
     if not rel or rel.startswith("/") or re.match(r"^[A-Za-z]:[/\\]", rel):
@@ -97,6 +111,21 @@ def root_path(root: str) -> Path:
 
 def project_path(root: Path, slug: str) -> Path:
     return root / "projects" / check_slug(slug, "project")
+
+
+def require_workspace_path(root: Path, path: Path) -> None:
+    """Reject a managed path that escapes the checkout through a symlinked parent."""
+    root = root.absolute()
+    path = path.absolute()
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        fail(f"Path escapes the repository: {path}")
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            fail(f"Symlinks are not allowed in managed paths: {current}")
 
 
 def read_safe(path: Path) -> str:
@@ -127,16 +156,43 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def image_magic_ok(name: str, head: bytes) -> bool:
+def image_magic_ok(name: str, data: bytes) -> bool:
     suffix = Path(name).suffix.lower()
     if suffix == ".png":
-        return head.startswith(b"\x89PNG\r\n\x1a\n")
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return False
+        position = 8
+        chunks: list[bytes] = []
+        while position + 12 <= len(data):
+            length = int.from_bytes(data[position:position + 4], "big")
+            end = position + 12 + length
+            if end > len(data):
+                return False
+            kind = data[position + 4:position + 8]
+            payload = data[position + 8:position + 8 + length]
+            expected = int.from_bytes(data[position + 8 + length:end], "big")
+            import zlib
+            if zlib.crc32(kind + payload) & 0xFFFFFFFF != expected:
+                return False
+            chunks.append(kind)
+            if len(chunks) == 1 and (kind != b"IHDR" or length != 13 or
+                                     int.from_bytes(payload[:4], "big") == 0 or
+                                     int.from_bytes(payload[4:8], "big") == 0):
+                return False
+            position = end
+            if kind == b"IEND":
+                return length == 0 and position == len(data) and b"IDAT" in chunks
+        return False
     if suffix in (".jpg", ".jpeg"):
-        return head.startswith(b"\xff\xd8\xff")
+        return len(data) >= 4 and data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9")
     if suffix == ".gif":
-        return head.startswith((b"GIF87a", b"GIF89a"))
+        return (len(data) >= 14 and data.startswith((b"GIF87a", b"GIF89a")) and
+                int.from_bytes(data[6:8], "little") > 0 and
+                int.from_bytes(data[8:10], "little") > 0 and data.endswith(b"\x3b"))
     if suffix == ".webp":
-        return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+        return (len(data) >= 20 and data[:4] == b"RIFF" and data[8:12] == b"WEBP" and
+                int.from_bytes(data[4:8], "little") == len(data) - 8 and
+                data[12:16] in (b"VP8 ", b"VP8L", b"VP8X"))
     return False
 
 
@@ -149,10 +205,10 @@ def validate_asset_file(path: Path) -> None:
         fail(f"Asset size must be 1..{MAX_ASSET} bytes: {path} ({size} bytes)")
     if not ASSET_NAME.fullmatch(path.name):
         fail(f"Unsafe asset name (lowercase, png/jpeg/gif/webp): {path.name}")
-    with path.open("rb") as handle:
-        head = handle.read(16)
-    if not image_magic_ok(path.name, head):
+    data = path.read_bytes()
+    if not image_magic_ok(path.name, data):
         fail(f"Asset content does not match an allowed image type: {path}")
+    check_secrets(data.decode("latin-1"))
 
 
 def is_asset_path(rel: str) -> bool:
@@ -263,6 +319,7 @@ def sync_lock(root: Path):
 
 def local_files(root: Path, prefix: str) -> list[str]:
     base = root / prefix
+    require_workspace_path(root, base)
     if not base.is_dir():
         return []
     results = []
@@ -318,6 +375,12 @@ def pending_paths(root: Path, prefix: str, allowed, region: str,
             size = int(run_git(root, "cat-file", "-s", f"{commit}:{path}").stdout)
             if size > (MAX_ASSET if is_asset_path(path) else MAX_FILE):
                 fail(f"{region.capitalize()} entry too large in unpublished history.")
+            if allow_modified and status == "M":
+                if is_asset_path(path) or len(parents) < 2:
+                    fail(f"Published {region} binary/history may not be rewritten.")
+                old = run_git(root, "cat-file", "blob", f"{parents[1]}:{path}").stdout
+                new = run_git(root, "cat-file", "blob", f"{commit}:{path}").stdout
+                verify_uat_text_append(path, old, new)
             if not is_asset_path(path):
                 check_secrets(run_git(root, "cat-file", "blob", f"{commit}:{path}").stdout)
             paths.add(path)
@@ -435,6 +498,7 @@ def task_new(root: Path, slug: str, task_id: str, *, title: str, revision: str,
              out_of_scope: str, expected: str, request: str, evidence: str,
              criteria: list[str]) -> Path:
     folder = task_root(root, slug, task_id)
+    require_workspace_path(root, folder)
     if not (project_path(root, slug) / "handoffs").is_dir():
         fail("Project is not initialized.")
     if folder.exists():
@@ -495,13 +559,23 @@ def task_new(root: Path, slug: str, task_id: str, *, title: str, revision: str,
 
 def task_approve(root: Path, slug: str, task_id: str, *, approved_by: str,
                  statement: str) -> Path:
+    """Serialize the multi-file approval write with all publication operations."""
+    git_ready(root)
+    with sync_lock(root):
+        return _task_approve(root, slug, task_id, approved_by=approved_by,
+                             statement=statement)
+
+
+def _task_approve(root: Path, slug: str, task_id: str, *, approved_by: str,
+                  statement: str) -> Path:
     """Record the human approval that publication depends on. Runs at most once per task."""
     folder = task_root(root, slug, task_id)
+    require_workspace_path(root, folder)
     brief_path = folder / "BRIEF.md"
     if not brief_path.is_file():
         fail(f"Task packet not found: {task_rel(slug, task_id)}")
-    if not approved_by.strip() or not statement.strip():
-        fail("--approved-by and --statement are required: approval must name a human and a decision.")
+    approved_by = one_line(approved_by, "--approved-by")
+    statement = one_line(statement, "--statement")
     if (folder / APPROVAL_FILE).exists():
         fail(f"{APPROVAL_FILE} already exists; an approved task is never re-approved or overwritten. "
              "Create a new task id or revision instead.")
@@ -510,23 +584,28 @@ def task_approve(root: Path, slug: str, task_id: str, *, approved_by: str,
         fail("Brief is already APPROVED but has no approval record. Inspect the packet manually.")
     if "- Approval: PENDING" not in brief:
         fail("Brief is not in PENDING state; refusing to guess its approval status.")
+    issues = packet_issues(root, slug, task_id, require_approved=False)
+    if issues:
+        fail("Task packet is not internally valid and cannot be approved: " + "; ".join(issues[:3]))
     approved = (brief
                 .replace("- Approval: PENDING", "- Approval: APPROVED", 1)
-                .replace("- Approved by: (none)", f"- Approved by: {approved_by.strip()}", 1)
+                .replace("- Approved by: (none)", f"- Approved by: {approved_by}", 1)
                 .replace("- Approved (UTC): (none)", f"- Approved (UTC): {stamp()}", 1))
     check_secrets(approved)
     check_secrets(statement)
     record = (f"# Approval record — {task_id}\n\n"
               f"- Project: {slug}\n"
               f"- Task ID: {task_id}\n"
-              f"- Approved by: {approved_by.strip()}\n"
+              f"- Approved by: {approved_by}\n"
               f"- Approved (UTC): {stamp()}\n"
               f"- BRIEF.md SHA-256: {sha256_text(approved)}\n"
-              f"- Approval statement: {statement.strip()}\n")
+              f"- ACCEPTANCE.md SHA-256: {sha256_text(read_safe(folder / 'ACCEPTANCE.md'))}\n"
+              f"- ASSETS.md SHA-256: {sha256_text(read_safe(folder / 'ASSETS.md'))}\n"
+              f"- Approval statement: {statement}\n")
     brief_path.write_text(approved, encoding="utf-8")
     with (folder / APPROVAL_FILE).open("x", encoding="utf-8") as handle:
         handle.write(record)
-    print(f"Approved {task_rel(slug, task_id)} by {approved_by.strip()} "
+    print(f"Approved {task_rel(slug, task_id)} by {approved_by} "
           f"(BRIEF.md SHA-256 {sha256_text(approved)[:12]}…)")
     return folder / APPROVAL_FILE
 
@@ -550,16 +629,69 @@ def parse_assets(text: str) -> dict[str, dict[str, str]]:
     return entries
 
 
+def asset_manifest_issues(root: Path, prefix: str, manifest_path: Path) -> list[str]:
+    """Verify that the manifest and the exact asset set agree in both directions."""
+    issues: list[str] = []
+    try:
+        manifest_text = read_safe(manifest_path)
+        check_secrets(manifest_text)
+    except HubError as exc:
+        manifest_text = ""
+        if manifest_path.exists():
+            issues.append(str(exc))
+    entries = parse_assets(manifest_text)
+    for rel, fields in entries.items():
+        if not is_asset_path(prefix + rel):
+            issues.append(f"unsafe manifest path: {rel}")
+            continue
+        path = root / prefix / rel
+        try:
+            require_workspace_path(root, path)
+            validate_asset_file(path)
+        except HubError as exc:
+            issues.append(str(exc))
+            continue
+        digest = sha256_file(path)
+        if fields.get("SHA-256") != digest:
+            issues.append(f"hash mismatch for {rel}; manifest and file disagree.")
+        if fields.get("Bytes") != str(path.stat().st_size):
+            issues.append(f"byte count mismatch for {rel}.")
+        expected_type = "image/" + path.suffix.lower().lstrip(".")
+        if fields.get("Type") != expected_type:
+            issues.append(f"media type mismatch for {rel}.")
+        for key in ("Origin", "Approved by", "Added (UTC)"):
+            if not fields.get(key, "").strip():
+                issues.append(f"{rel} is missing the '{key}' field.")
+    registered = set(entries)
+    for rel in local_files(root, prefix):
+        rest = rel[len(prefix):]
+        if rest.startswith("assets/") and rest not in registered:
+            issues.append(f"{rest} is present but not registered in ASSETS.md.")
+    return issues
+
+
 def task_add_asset(root: Path, slug: str, task_id: str, source: Path, *, origin: str,
                    approved_by: str) -> Path:
+    """Serialize asset bytes and manifest updates so neither can be lost."""
+    git_ready(root)
+    with sync_lock(root):
+        return _task_add_asset(root, slug, task_id, source, origin=origin,
+                               approved_by=approved_by)
+
+
+def _task_add_asset(root: Path, slug: str, task_id: str, source: Path, *, origin: str,
+                    approved_by: str) -> Path:
     """Register one intentionally approved image with a verifiable content hash."""
     folder = task_root(root, slug, task_id)
+    require_workspace_path(root, folder)
+    require_workspace_path(root, folder / "assets")
     manifest_path = folder / "ASSETS.md"
     if not manifest_path.is_file():
         fail(f"Task packet not found: {task_rel(slug, task_id)}")
-    for name, value in (("--origin", origin), ("--approved-by", approved_by)):
-        if not value.strip():
-            fail(f"{name} is required: an asset must carry provenance and an approver.")
+    origin = one_line(origin, "--origin")
+    approved_by = one_line(approved_by, "--approved-by")
+    if (folder / APPROVAL_FILE).exists():
+        fail("Assets cannot be added after task approval; create a new task id or revision.")
     source = Path(source).expanduser()
     validate_asset_file(source)
     name = source.name.lower()
@@ -582,8 +714,8 @@ def task_add_asset(root: Path, slug: str, task_id: str, source: Path, *, origin:
              f"- SHA-256: {digest}\n"
              f"- Bytes: {source.stat().st_size}\n"
              f"- Type: image/{Path(name).suffix.lstrip('.')}\n"
-             f"- Origin: {origin.strip()}\n"
-             f"- Approved by: {approved_by.strip()}\n"
+             f"- Origin: {origin}\n"
+             f"- Approved by: {approved_by}\n"
              f"- Added (UTC): {stamp()}\n")
     check_secrets(block)
     destination.write_bytes(source.read_bytes())
@@ -600,11 +732,17 @@ def packet_issues(root: Path, slug: str, task_id: str, require_approved: bool = 
     """
     folder = task_root(root, slug, task_id)
     issues: list[str] = []
+    try:
+        require_workspace_path(root, folder)
+    except HubError as exc:
+        return [str(exc)]
     if not folder.is_dir():
         return [f"Task packet missing: {task_rel(slug, task_id)}"]
+    contents: dict[str, str] = {}
     for name in TASK_FILES:
         try:
-            check_secrets(read_safe(folder / name))
+            contents[name] = read_safe(folder / name)
+            check_secrets(contents[name])
         except HubError as exc:
             issues.append(f"{name}: {exc}")
     try:
@@ -626,37 +764,34 @@ def packet_issues(root: Path, slug: str, task_id: str, require_approved: bool = 
         except HubError as exc:
             issues.append(f"{APPROVAL_FILE}: {exc}")
             approval = ""
+        hashes = {
+            "- BRIEF.md SHA-256:": brief,
+            "- ACCEPTANCE.md SHA-256:": contents.get("ACCEPTANCE.md", ""),
+            "- ASSETS.md SHA-256:": contents.get("ASSETS.md", ""),
+        }
         for marker in ("- Approved by:", "- Approved (UTC):", "- Approval statement:",
-                       "- BRIEF.md SHA-256:"):
+                       *hashes):
             if marker not in approval:
                 issues.append(f"{APPROVAL_FILE}: missing {marker}")
-        recorded = parse_fields(approval, ("- BRIEF.md SHA-256:",)).get("- BRIEF.md SHA-256:", "")
-        if SHA256.fullmatch(recorded) and recorded != sha256_text(brief):
-            issues.append("BRIEF.md changed after approval; the approval record no longer binds "
-                          "the brief (re-approve under a new task revision).")
-    try:
-        manifest_text = read_safe(folder / "ASSETS.md")
-    except HubError:
-        return issues
-    entries = parse_assets(manifest_text)
+        recorded_fields = parse_fields(approval, tuple(hashes))
+        for marker, content in hashes.items():
+            recorded = recorded_fields.get(marker, "")
+            filename = marker.removeprefix("- ").removesuffix(" SHA-256:")
+            if not SHA256.fullmatch(recorded):
+                issues.append(f"{APPROVAL_FILE}: invalid or missing hash for {filename}")
+            elif recorded != sha256_text(content):
+                if filename == "BRIEF.md":
+                    issues.append("BRIEF.md changed after approval; the approval record no longer "
+                                  "binds the brief (create a NEW task id or revision).")
+                else:
+                    issues.append(f"{filename} changed after approval; the approval record no "
+                                  "longer binds the packet (create a NEW task id or revision).")
     prefix = task_rel(slug, task_id)
-    registered = set(entries)
-    for rel, fields in entries.items():
-        path = root / prefix / rel
-        try:
-            validate_asset_file(path)
-        except HubError as exc:
-            issues.append(f"ASSETS.md: {exc}")
-            continue
-        if fields.get("SHA-256") != sha256_file(path):
-            issues.append(f"ASSETS.md: hash mismatch for {rel}; manifest and file disagree.")
-        for key in ("Bytes", "Type", "Origin", "Approved by", "Added (UTC)"):
-            if key not in fields:
-                issues.append(f"ASSETS.md: {rel} is missing the '{key}' field.")
-    for rel in local_files(root, prefix):
-        rest = rel[len(prefix):]
-        if rest.startswith("assets/") and rest not in registered:
-            issues.append(f"assets/: {rest} is present but not registered in ASSETS.md.")
+    issues.extend("ASSETS.md: " + issue for issue in
+                  asset_manifest_issues(root, prefix, folder / "ASSETS.md"))
+    acceptance = contents.get("ACCEPTANCE.md", "")
+    if "- [ ]" not in acceptance and "- [x]" not in acceptance:
+        issues.append("ACCEPTANCE.md: no verifiable acceptance criteria found")
     return issues
 
 
@@ -694,6 +829,7 @@ def task_read(root: Path, slug: str, task_id: str, *, do_sync: bool) -> str:
     if do_sync:
         pull(root)
     folder = task_root(root, slug, task_id)
+    require_workspace_path(root, folder)
     if not folder.is_dir():
         fail(f"Task packet not found: {task_rel(slug, task_id)}")
     prefix = task_rel(slug, task_id)
@@ -727,7 +863,7 @@ def uat_root(root: Path, slug: str) -> Path:
 
 
 def uat_rel(slug: str, feedback_id: str) -> str:
-    return f"projects/{check_slug(slug, 'project')}/uat/{feedback_id}/"
+    return f"projects/{check_slug(slug, 'project')}/uat/{check_uat_id(feedback_id)}/"
 
 
 def is_uat_file(rel: str, prefix: str) -> bool:
@@ -752,8 +888,18 @@ def uat_new(root: Path, slug: str, *, task_id: str, reporter: str, source_repo: 
                         ("--expected", expected), ("--observed", observed)):
         if not value.strip():
             fail(f"{name} is required: a usable defect report needs it.")
+    source_repo = one_line(source_repo, "--source-repo")
+    tested_commit = one_line(tested_commit, "--tested-commit")
+    environment = one_line(environment, "--environment")
+    if related_pr.strip():
+        related_pr = one_line(related_pr, "--related-pr")
+    if related_handoff.strip():
+        related_handoff = one_line(related_handoff, "--related-handoff")
+    if screenshot_origin.strip():
+        screenshot_origin = one_line(screenshot_origin, "--screenshot-origin")
     feedback_id = f"{now_utc().strftime('%Y%m%dT%H%M%S%fZ')}_{reporter}_{uuid.uuid4().hex[:10]}"
     folder = uat_root(root, slug) / feedback_id
+    require_workspace_path(root, folder)
     if folder.exists():
         fail(f"Feedback id collision: {folder}")
     folder.mkdir(parents=True)
@@ -818,6 +964,19 @@ def uat_history(text: str) -> list[str]:
     return lines
 
 
+def valid_uat_history_entry(entry: str) -> bool:
+    parts = entry.split(" | ", 3)
+    if len(parts) != 4 or parts[1] not in UAT_STATUS or not SLUG.fullmatch(parts[2]):
+        return False
+    try:
+        moment = dt.datetime.fromisoformat(parts[0])
+    except ValueError:
+        return False
+    if moment.tzinfo is None or moment.utcoffset() != dt.timedelta(0):
+        return False
+    return bool(parts[3].strip()) and "\n" not in parts[3] and "\r" not in parts[3]
+
+
 def uat_current_status(text: str) -> str:
     history = uat_history(text)
     if not history:
@@ -826,19 +985,86 @@ def uat_current_status(text: str) -> str:
     return parts[1] if len(parts) > 1 else "unknown"
 
 
+def uat_issues(root: Path, slug: str, feedback_id: str) -> list[str]:
+    check_uat_id(feedback_id)
+    folder = uat_root(root, slug) / feedback_id
+    require_workspace_path(root, folder)
+    issues: list[str] = []
+    try:
+        text = read_safe(folder / "UAT_FEEDBACK.md")
+        check_secrets(text)
+    except HubError as exc:
+        return [str(exc)]
+    for marker in UAT_MARKERS:
+        if marker not in text:
+            issues.append(f"UAT_FEEDBACK.md: missing {marker}")
+    history = uat_history(text)
+    if not history:
+        issues.append("UAT_FEEDBACK.md: status history is empty")
+    elif any(not valid_uat_history_entry(entry) for entry in history):
+        issues.append("UAT_FEEDBACK.md: invalid status history entry")
+    else:
+        states = [entry.split(" | ", 3)[1] for entry in history]
+        expected = list(UAT_STATUS[:len(states)])
+        if states != expected or len(states) > len(UAT_STATUS):
+            issues.append("UAT_FEEDBACK.md: status history skips, repeats, or reorders a transition")
+        timestamps = [dt.datetime.fromisoformat(entry.split(" | ", 1)[0]) for entry in history]
+        if timestamps != sorted(timestamps):
+            issues.append("UAT_FEEDBACK.md: status history timestamps are out of order")
+    prefix = uat_rel(slug, feedback_id)
+    issues.extend("ASSETS.md: " + issue for issue in
+                  asset_manifest_issues(root, prefix, folder / "ASSETS.md"))
+    screenshot = parse_fields(text, ("- Screenshot:",)).get("- Screenshot:", "")
+    if screenshot and screenshot != "None":
+        match = re.fullmatch(r"(assets/[a-z0-9][a-z0-9._-]{0,63}\.(?:png|jpe?g|gif|webp)) "
+                             r"\(SHA-256: ([0-9a-f]{64}); origin: .+\)", screenshot)
+        if not match:
+            issues.append("UAT_FEEDBACK.md: invalid screenshot reference")
+        else:
+            entries = parse_assets(read_safe(folder / "ASSETS.md"))
+            if entries.get(match.group(1), {}).get("SHA-256") != match.group(2):
+                issues.append("UAT_FEEDBACK.md: screenshot reference does not match ASSETS.md")
+    return issues
+
+
+def verify_uat(root: Path, slug: str, feedback_id: str) -> None:
+    issues = uat_issues(root, slug, feedback_id)
+    if issues:
+        fail("UAT record is not publishable/readable: " + "; ".join(issues[:3]))
+
+
 def uat_status(root: Path, slug: str, feedback_id: str, *, status: str, by: str,
                note: str, related_pr: str) -> Path:
+    """Serialize local status appends with publication to prevent a lost update."""
+    git_ready(root)
+    with sync_lock(root):
+        return _uat_status(root, slug, feedback_id, status=status, by=by, note=note,
+                           related_pr=related_pr)
+
+
+def _uat_status(root: Path, slug: str, feedback_id: str, *, status: str, by: str,
+                note: str, related_pr: str) -> Path:
     """Append a status transition. Earlier lines are never rewritten."""
     if status not in UAT_STATUS:
         fail(f"--status must be one of: {', '.join(UAT_STATUS)}")
     if not by.strip():
         fail("--by is required: every status transition names its author.")
     check_slug(by, "agent")
+    check_uat_id(feedback_id)
+    note = one_line(note or "no note", "--note")
+    if related_pr.strip():
+        related_pr = one_line(related_pr, "--related-pr")
     path = uat_root(root, slug) / feedback_id / "UAT_FEEDBACK.md"
+    require_workspace_path(root, path)
     text = read_safe(path)
-    if uat_current_status(text) == status:
+    current = uat_current_status(text)
+    if current == status:
         fail(f"Current status is already '{status}'; refusing to append a duplicate entry.")
-    detail = f"{stamp()} | {status} | {by} | {note.strip() or 'no note'}"
+    next_status = {"reported": "reproduced", "reproduced": "fixed", "fixed": "re-tested"}
+    if next_status.get(current) != status:
+        fail(f"Invalid UAT transition: '{current}' must move to "
+             f"'{next_status.get(current, 'a new feedback record')}', not '{status}'.")
+    detail = f"{stamp()} | {status} | {by} | {note}"
     if related_pr.strip():
         detail += f" | PR {related_pr.strip()}"
     check_secrets(detail)
@@ -853,9 +1079,9 @@ def uat_publish(root: Path, slug: str, feedback_id: str) -> None:
     with sync_lock(root):
         prefix = uat_rel(slug, feedback_id)
         folder = uat_root(root, slug) / feedback_id
+        require_workspace_path(root, folder)
         if not (folder / "UAT_FEEDBACK.md").is_file():
             fail(f"UAT record not found: {prefix}")
-        check_secrets(read_safe(folder / "UAT_FEEDBACK.md"))
         branch = git_ready(root)
         run_git(root, "fetch", "origin", branch)
         state = remote_state(root, prefix)
@@ -864,6 +1090,7 @@ def uat_publish(root: Path, slug: str, feedback_id: str) -> None:
             return
         if state == "different":
             verify_append_only(root, prefix)
+        verify_uat(root, slug, feedback_id)
         require_git_identity(root)
         publish_paths(root, prefix=prefix, allowed=lambda path: is_uat_file(path, prefix),
                       region="UAT record", allow_modified=True,
@@ -885,9 +1112,24 @@ def verify_append_only(root: Path, prefix: str) -> None:
                 fail(f"Published UAT asset must not change: {rel}")
             continue
         old = run_git(root, "cat-file", "blob", f"FETCH_HEAD:{rel}").stdout
-        if not read_safe(root / rel).startswith(old):
-            fail(f"Published UAT record is append-only; a rewrite was detected in {rel}. "
-                 "Create a new feedback entry instead of editing history.")
+        verify_uat_text_append(rel, old, read_safe(root / rel))
+
+
+def verify_uat_text_append(rel: str, old: str, new: str) -> None:
+    if not new.startswith(old):
+        fail(f"Published UAT record is append-only; a rewrite was detected in {rel}. "
+             "Create a new feedback entry instead of editing history.")
+    suffix = new[len(old):]
+    if rel.endswith("UAT_FEEDBACK.md"):
+        additions = [line[2:] for line in suffix.splitlines() if line]
+        if (any(not line.startswith("- ") for line in suffix.splitlines() if line) or
+                any(not valid_uat_history_entry(entry) for entry in additions)):
+            fail(f"Published UAT record may only append valid status-history lines: {rel}")
+    elif rel.endswith("ASSETS.md"):
+        old_entries = parse_assets(old)
+        new_entries = parse_assets(new)
+        if any(new_entries.get(key) != value for key, value in old_entries.items()):
+            fail(f"Published UAT asset manifest may only add new entries: {rel}")
 
 
 def uat_read(root: Path, slug: str, feedback_id: str | None, *, do_sync: bool) -> str:
@@ -895,9 +1137,11 @@ def uat_read(root: Path, slug: str, feedback_id: str | None, *, do_sync: bool) -
         pull(root)
     base = uat_root(root, slug)
     if feedback_id:
+        check_uat_id(feedback_id)
         folder = base / feedback_id
         if not (folder / "UAT_FEEDBACK.md").is_file():
             fail(f"UAT record not found: {uat_rel(slug, feedback_id)}")
+        verify_uat(root, slug, feedback_id)
         blocks = [f"# UAT record {feedback_id}",
                   f"Current status: {uat_current_status(read_safe(folder / 'UAT_FEEDBACK.md'))}",
                   read_safe(folder / "UAT_FEEDBACK.md")]
@@ -939,6 +1183,7 @@ def onboard_check(root: Path, *, source_repo: str = "", prove_push: bool = False
     """
     rows: list[tuple[str, str, str]] = []
     push_ok = False
+    identity_ok = False
 
     try:
         branch = git_ready(root)
@@ -952,26 +1197,22 @@ def onboard_check(root: Path, *, source_repo: str = "", prove_push: bool = False
         try:
             require_git_identity(root)
             rows.append(("GIT_IDENTITY", "PASS", "committer identity resolves"))
+            identity_ok = True
         except HubError as exc:
             rows.append(("GIT_IDENTITY", "BLOCKED", str(exc)))
         if prove_push:
-            ok, detail = probe_push(root, branch)
-            rows.append(("CONTEXT_PUSH", "PASS" if ok else "BLOCKED", detail))
-            push_ok = ok
-        else:
-            run_git(root, "fetch", "origin", branch, check=False)
-            ahead = run_git(root, "rev-list", "--count", "FETCH_HEAD..HEAD",
-                            check=False).stdout.strip()
-            if ahead == "0":
-                rows.append(("CONTEXT_PUSH", "PASS",
-                             "HEAD is contained in origin; a historical push is provable "
-                             "(rerun with --prove-push for a live proof)"))
-                push_ok = True
+            if identity_ok:
+                ok, detail = probe_push(root, branch)
+                rows.append(("CONTEXT_PUSH", "PASS" if ok else "BLOCKED", detail))
+                push_ok = ok
             else:
-                rows.append(("CONTEXT_PUSH", "UNKNOWN",
-                             f"{ahead or 'unknown'} local commit(s) never reached origin; "
-                             "push permission is not proven"))
-                push_ok = False
+                rows.append(("CONTEXT_PUSH", "BLOCKED",
+                             "live proof requires a valid Git committer identity"))
+        else:
+            rows.append(("CONTEXT_PUSH", "UNKNOWN",
+                         "read access and remote history do not prove current write permission; "
+                         "rerun with --prove-push for a live proof"))
+            push_ok = False
 
     if source_repo.strip():
         ok, detail = remote_reachable(source_repo.strip())
@@ -1008,8 +1249,19 @@ def probe_push(root: Path, branch: str) -> tuple[bool, str]:
     pushed = run_git(root, "push", "origin", f"{commit}:{probe}", check=False)
     if pushed.returncode:
         return False, (pushed.stderr or pushed.stdout).strip().splitlines()[-1]
-    readback = run_git(root, "ls-remote", "origin", probe).stdout.strip()
-    cleanup = run_git(root, "push", "origin", "--delete", probe, check=False)
+    readback = ""
+    read_error = ""
+    try:
+        readback_result = run_git(root, "ls-remote", "origin", probe, check=False)
+        readback = readback_result.stdout.strip()
+        if readback_result.returncode:
+            read_error = (readback_result.stderr or readback_result.stdout).strip()
+    except HubError as exc:
+        read_error = str(exc)
+    finally:
+        cleanup = run_git(root, "push", "origin", "--delete", probe, check=False)
+    if read_error:
+        return False, "probe readback failed; cleanup attempted: " + read_error
     if commit not in readback:
         return False, "probe ref did not read back; write permission unproven"
     if cleanup.returncode:
@@ -1056,6 +1308,9 @@ def write_handoff(root: Path, project: str, agent: str, task: str,
         if not pr.strip():
             fail("--pr is required when recording an implementation result; pass NOT_OPENED if "
                  "no pull request exists.")
+        for name, value in (("--source-repo", source_repo), ("--branch", branch),
+                            ("--code-sha", code_sha), ("--pr", pr)):
+            one_line(value, name)
         acceptance_value = (acceptance or "PENDING").strip().upper()
         if acceptance_value not in ("PENDING", "PASSED"):
             fail("--acceptance must be PENDING or PASSED.")
@@ -1063,13 +1318,23 @@ def write_handoff(root: Path, project: str, agent: str, task: str,
             if not uat.strip():
                 fail("--acceptance PASSED requires --uat <feedback-id>; AI implementation done is "
                      "not the same as human UAT passed.")
-            record = uat_root(root, project) / uat.strip() / "UAT_FEEDBACK.md"
+            feedback_id = check_uat_id(uat.strip())
+            verify_uat(root, project, feedback_id)
+            record = uat_root(root, project) / feedback_id / "UAT_FEEDBACK.md"
             if not record.is_file():
                 fail(f"--uat {uat.strip()} does not exist in this checkout.")
             state = uat_current_status(read_safe(record))
             if state != "re-tested":
                 fail(f"UAT feedback {uat.strip()} is '{state}', not 're-tested'; "
                      "human acceptance cannot be declared yet.")
+            fields = parse_fields(read_safe(record),
+                                  ("- Source repo:", "- Tested commit / build:"))
+            if fields.get("- Source repo:") != source_repo.strip():
+                fail("The re-tested UAT record belongs to a different source repository.")
+            if fields.get("- Tested commit / build:") != code_sha.strip():
+                fail("The re-tested UAT record does not match --code-sha.")
+        one_line(build, "--build")
+        one_line(tests, "--tests")
         content += (
             "\n## Implementation evidence\n"
             f"- Source repo: {source_repo.strip()}\n"
@@ -1134,6 +1399,13 @@ def validate(root: Path, slug: str) -> int:
             except HubError as exc:
                 found = [str(exc)]
             errors.extend(f"tasks/{task_dir.name}: {issue}" for issue in found)
+    if (folder / "uat").is_dir():
+        for uat_dir in sorted(path for path in (folder / "uat").iterdir() if path.is_dir()):
+            try:
+                found = uat_issues(root, slug, uat_dir.name)
+            except HubError as exc:
+                found = [str(exc)]
+            errors.extend(f"uat/{uat_dir.name}: {issue}" for issue in found)
     if errors:
         for error in errors:
             print("FAIL:", error, file=sys.stderr)

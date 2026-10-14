@@ -20,7 +20,7 @@ AI Context Hub solves a narrower, practical problem: **on request, each authoriz
 | Re-explaining background at every handoff | On-demand access to goals, constraints, decisions, current status, and recent handoffs |
 | "Agent A says it is done" is not evidence | Named handoffs with evidence fields, timestamps and Git commit history |
 | Agent updates can collide or be lost | Unique append-only handoff files, guarded Git sync and explicit conflict handling |
-| An approved plan quietly drifts while it is being built | An approved packet is bound to the brief's hash; a post-approval edit cannot be published |
+| An approved plan quietly drifts while it is being built | An approved packet binds its brief, acceptance criteria and asset manifest; a post-approval edit cannot be published |
 | A defect report arrives as another ZIP of the source tree | UAT records reference the tested commit and PR, and are readable in place |
 | A full agent orchestration platform is overkill | CLI built with the Python standard library + Git; no server, database or extra model API |
 
@@ -58,7 +58,7 @@ PRIVATE Git repository: my-ai-context
     projects/<id>/handoffs/<unique id>.md  (append-only agent logs)
     projects/<id>/tasks/<task-id>/         (approved implementation packet)
         BRIEF.md  ACCEPTANCE.md  ASSETS.md
-        APPROVAL.md                        binds the approved brief to a SHA-256
+        APPROVAL.md                        binds the approved packet text to SHA-256 hashes
         assets/<approved files>            hash-verified evidence images
     projects/<id>/uat/<feedback-id>/       (append-only UAT defect records)
         UAT_FEEDBACK.md  ASSETS.md  assets/<screenshots>
@@ -102,7 +102,8 @@ existing-log edits, unsafe files and detected credentials before pushing.
 
 Concurrent updates from separate clones append a merge commit without rewriting
 either handoff commit. A filename collision stops for manual review, even when
-the contents match. `sync-pull` and `sync-push` share a per-checkout lock;
+the contents match. Sync/publish commands and the multi-file approval, asset-manifest
+and UAT-status updates share a per-checkout lock;
 use separate clones for separate agents and do not run external Git mutations
 during a sync. After a process crash, inspect `.git/ach-sync.lock` and confirm no
 sync is running before manually removing a stale lock. No automatic lock stealing.
@@ -145,6 +146,11 @@ python .../ach.py --root . uat-status  --project demo --feedback <id> --status f
 A published packet can never be overwritten: changing it requires a new task id or
 revision. A published UAT record may only grow — appending a status line or a new
 screenshot is allowed, rewriting or deleting published content fails closed.
+
+Approval and UAT author names are recorded assertions. The CLI preserves and checks them,
+but does not authenticate a human identity. Host access controls, protected branches and
+human review provide that authority. Run `onboard-check --prove-push` for a current write
+test; seeing an older commit on the remote proves read/history only.
 
 The full manual 3-agent pilot (planning AI approves, implementation agent builds,
 reviewer agent verifies, human runs UAT) is in the

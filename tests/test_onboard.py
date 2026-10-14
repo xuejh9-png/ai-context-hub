@@ -25,13 +25,14 @@ class OnboardCheckTests(HubFixture):
     def assert_row(self, output: str, name: str, status: str) -> None:
         self.assertRegex(output, re.compile(rf"^\s*{name}\s+{status}\b", re.M))
 
-    def test_ready_when_context_and_source_are_both_readable(self):
+    def test_readable_context_and_source_do_not_prove_push_permission(self):
         code, output = self.check(source_repo=str(self.remote))
-        self.assertEqual(0, code, output)
+        self.assertEqual(1, code, output)
         self.assert_row(output, "CONTEXT_READ", "PASS")
         self.assert_row(output, "SOURCE_READ", "PASS")
+        self.assert_row(output, "CONTEXT_PUSH", "UNKNOWN")
         self.assert_row(output, "CONNECTOR_READ", "UNKNOWN")
-        self.assertIn("VERDICT: READY", output)
+        self.assertIn("VERDICT: BLOCKED", output)
 
     def test_blocked_when_no_source_repository_is_configured(self):
         code, output = self.check(source_repo="")
@@ -53,7 +54,7 @@ class OnboardCheckTests(HubFixture):
         code, output = self.check(source_repo=str(self.remote))
         self.assertEqual(1, code, output)
         self.assert_row(output, "CONTEXT_PUSH", "UNKNOWN")
-        self.assertIn("never reached origin", output)
+        self.assertIn("do not prove current write permission", output)
 
     def test_prove_push_writes_reads_back_and_cleans_up(self):
         (self.repo / "projects/demo/CURRENT_STATUS.md").write_text("local only")

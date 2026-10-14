@@ -28,8 +28,9 @@ def png_bytes(pad: int = 0) -> bytes:
 
     header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
     pixels = zlib.compress(b"\x00" + b"\xff\x00\x00")
+    extra = chunk(b"tEXt", b"fixture\x00" + b"x" * pad) if pad else b""
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels)
-            + chunk(b"IEND", b"") + b"\x00" * pad)
+            + extra + chunk(b"IEND", b""))
 
 
 class HubFixture(unittest.TestCase):

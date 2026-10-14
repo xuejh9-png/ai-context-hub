@@ -28,7 +28,7 @@ projects/<slug>/
     BRIEF.md                    approved scope, target repo and baseline
     ACCEPTANCE.md               verifiable acceptance criteria
     ASSETS.md                   asset manifest with SHA-256 per approved file
-    APPROVAL.md                 human approval record bound to BRIEF.md's hash
+    APPROVAL.md                 approval assertion bound to three packet-text hashes
     assets/<name>               approved evidence images (png/jpeg/gif/webp)
   uat/<feedback-id>/            v0.2
     UAT_FEEDBACK.md             append-only defect record with status history
@@ -44,7 +44,7 @@ absolute paths and symlinks are rejected everywhere.
 
 ```text
 task-new  ────────► DRAFT        (local only; sync-push cannot carry it)
-task-approve ─────► APPROVED     (once per task; binds BRIEF.md by SHA-256)
+task-approve ─────► APPROVED     (once; binds BRIEF, ACCEPTANCE and ASSETS by SHA-256)
 task-publish ─────► PUBLISHED    (immutable from then on)
 uat-new ──────────► reported ──► reproduced ──► fixed ──► re-tested   (append-only)
 handoff ──────────► AI DONE, human acceptance still PENDING
@@ -53,14 +53,14 @@ handoff ──────────► AI DONE, human acceptance still PENDIN
 | Gate | Enforced by | Failure mode |
 | --- | --- | --- |
 | No packet without approved scope | `task-publish` requires `APPROVAL.md` and `- Approval: APPROVED` | `BLOCKED`, nothing pushed |
-| Approved brief cannot drift | `APPROVAL.md` stores `BRIEF.md`'s SHA-256; re-checked at publish and at `task-read` | publication refused |
+| Approved packet cannot drift | `APPROVAL.md` stores the SHA-256 of `BRIEF.md`, `ACCEPTANCE.md` and `ASSETS.md`; re-checked at publish/read | publication refused |
 | Approval is a single decision | `task-approve` refuses when `APPROVAL.md` already exists | re-approval requires a new task id/revision |
 | Approved assets are exactly the approved bytes | manifest SHA-256 vs file, image magic bytes, size ≤ 5 MB | publication refused |
 | Only intended files are published | porcelain status must contain only that packet's allowed paths; every unpublished commit is inspected | unrelated/modified changes abort the publish |
 | Evidence, not declarations | implementation handoffs require repo/branch/real SHA/PR/build/tests | handoff refused |
 | AI done ≠ human accepted | `--acceptance PASSED` requires a referenced `re-tested` UAT record | handoff refused |
 | History is not rewritten | published packets are compared against the remote; published UAT records must be a strict superset (append-only) | publish refused |
-| Access is proven, not assumed | `onboard-check` verifies context read, source read and push permission | `BLOCKED` verdict |
+| Access is proven, not assumed | `onboard-check --prove-push` verifies context write permission live; ordinary read/history is insufficient | `BLOCKED` verdict |
 
 ## Asset rules
 
@@ -71,8 +71,12 @@ handoff ──────────► AI DONE, human acceptance still PENDIN
 * Registration is idempotent for identical bytes and **refuses** to replace a registered
   asset with different bytes. Register the new file under a new name.
 * A file present under `assets/` but absent from the manifest is an error, and vice versa.
-* Binary assets are the only non-UTF-8 payload the CLI publishes; they are excluded from
-  the text secret scan and instead validated by size, name and image magic bytes.
+* Binary assets are the only non-UTF-8 payload the CLI publishes. They are checked for
+  obvious credential text plus size, name, container structure and type signatures. This
+  cannot detect sensitive pixels, steganography or every malformed decoder edge case;
+  approval still requires a human to inspect the image.
+* Register every task asset before `task-approve`. Approval hashes the completed manifest;
+  adding or changing an asset later requires a new task id or revision.
 
 ## User trigger protocol
 
@@ -97,7 +101,8 @@ no after-chat or background posting.
   limitation truthfully and use the local CLI, which is the supported path for images.
 * A connector's read permission does not imply write permission. Both must be observed
   separately and recorded in a handoff.
-* `onboard-check` can prove context read, source read and push permission. Whether a
+* `onboard-check --prove-push` can prove context read, source read and current push permission.
+  Without the flag, push permission remains `UNKNOWN`. Whether a
   specific connector can read the repository is verifiable only inside that connector and
   is reported as `UNKNOWN` by this CLI.
 
@@ -111,3 +116,9 @@ All publishing commands are fail-closed:
 * no command ever force-pushes, rewrites remote history, or deletes a published record;
 * a rejected push leaves the commit local and tells the operator to fix connectivity or
   permissions and rerun the same command.
+
+`--approved-by`, UAT reporter and status-author values are stored assertions. The CLI does
+not authenticate those people. Git hosting permissions, protected branches and review
+policy must enforce who may publish. Likewise, append-only checks prevent ordinary CLI
+publication of rewritten UAT history; an administrator who can rewrite Git history remains
+outside this tool's trust boundary.

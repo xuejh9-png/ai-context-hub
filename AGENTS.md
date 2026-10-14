@@ -47,7 +47,11 @@ ach task-approve --project <slug> --task <task-id> --approved-by <user> --statem
 ach task-publish --project <slug> --task <task-id>
 ```
 
-* `task-approve` runs at most once per task and binds `BRIEF.md` by SHA-256. Editing the brief afterwards invalidates the approval, and `task-publish` refuses.
+* `task-approve` runs at most once per task and binds `BRIEF.md`, `ACCEPTANCE.md` and
+  `ASSETS.md` by SHA-256. Register every approved asset before approval. Editing any bound
+  file afterwards invalidates the approval, and `task-publish` refuses.
+* `--approved-by` and UAT `--by` are attributable assertions stored in Git. The CLI does not
+  authenticate that person; repository access controls and human review remain authoritative.
 * `task-publish` fails closed on: missing approval, hash mismatch, unregistered asset, asset hash mismatch, secret pattern, unrelated untracked or tracked changes, missing Git identity, unreachable remote, and an already-published packet with different content. It never force-pushes and never overwrites. A change to a published packet requires a new task id or revision.
 * Publication is the **only** way a packet reaches the shared remote. `sync-push` deliberately cannot carry packet files.
 
@@ -77,7 +81,10 @@ ach uat-read    --project <slug> [--feedback <id>] [--sync]
 ach onboard-check --source-repo <source repo URL> [--prove-push]
 ```
 
-`READY` requires proven context read, an accessible source repository and proven push permission. `BLOCKED` means independent review is not possible yet. If the source remote is not accessible, **ask for access setup — never for another ZIP of the project**.
+`READY` requires proven context read, an accessible source repository and a live
+`--prove-push` check. Historical remote commits prove neither current identity nor current
+write permission. `BLOCKED` means independent review is not possible yet. If the source
+remote is not accessible, **ask for access setup — never for another ZIP of the project**.
 
 ## Roles (defaults, not platform restrictions)
 
