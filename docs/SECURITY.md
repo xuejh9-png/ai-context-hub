@@ -53,3 +53,40 @@ repository. Treat it as a deliberate decision:
 - Names in approval/UAT fields are assertions. Enforce identity and append-only Git history
   through repository permissions, protected branches and review; the CLI cannot prevent an
   authorized administrator from rewriting the remote.
+
+## Onboarding application source (v0.3)
+
+Moving an existing local project to a private repository is the highest-risk operation this
+tool performs, because it can publish years of accumulated secrets in one push.
+
+- **Inspect before you touch.** `source-inspect` is read-only by design and must be run first.
+  It reports the candidate set, not a verdict to trust blindly.
+- **Denials are refusals.** Environment files, private keys, keystores, databases, credential
+  patterns inside current or historical blob contents, and any denied path present in the
+  project's Git **history** abort history-mode planning. Archives, backups, dumps, oversized
+  historical blobs and an incomplete history scan also fail closed, because pushing history
+  publishes what the working tree no longer contains.
+- **Archives, dumps, backups and oversized files** are excluded by default and need an explicit
+  `--allow-review` decision. A backup that was never meant to leave the machine is a common
+  leak, and `.gitignore` does not remove what history already has.
+- **Visibility is verified, not asserted.** A GitHub destination is accepted only when the
+  unauthenticated API returns exactly `404` and authenticated Git access succeeds. Public `200`,
+  rate limits and API/network errors are refused. The check runs during planning, after approval,
+  and again immediately before push.
+- **The approved digest is the authorization.** `source-plan` prints a SHA-256 binding the local
+  path, destination, branch, mode, planned HEAD, authorization statement and exact file list;
+  editing any of them invalidates approval. History mode also refuses when the checked-out branch
+  or HEAD changed after planning. The immutable commit tree's paths, sizes and blob SHA-256 values
+  are compared against the manifest before the push.
+- **Non-destructive Git only.** An existing `origin` that differs from the plan is a hard
+  refusal; there is no repointing, no `git init` over an existing repository, no force-push and
+  no automatic merge of divergent histories.
+- **Failed operations leak nothing and lose nothing.** History mode refuses an existing staged
+  index and restores the original index bytes if commit fails. Snapshot mode leaves branches,
+  refs, reflogs, index and working files unchanged; a failed push records the exact pending commit
+  outside the project for an idempotent retry. A per-project lock blocks concurrent publishers.
+- **Never confuse "we can read it" with "they can read it".** The pushing machine's read-back
+  says nothing about another tool's permissions. Record third-party access per tool; a public
+  claim of a shared project requires both.
+- **The host is the real boundary.** Repository visibility, branch protection and collaborator
+  scopes are configured outside this tool; the CLI can only refuse to make things worse.

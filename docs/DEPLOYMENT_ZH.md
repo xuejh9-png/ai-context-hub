@@ -155,3 +155,59 @@ v0.2 任务包与 UAT 闭环：
 跑通 `python -m unittest discover -s tests -v`；确认公开仓库不包含 `projects/` 私人数据目录或其他私人文件。公开项目只有代码、说明和虚构示例。开源许可证需要仓库所有者单独选择；未作决定前不要自动添加 MIT/Apache 授权。
 
 手工三方试点（规划方批准 → 实现方交付证据 → 审查方独立核对 → 你本人做 UAT）的完整步骤见 [PILOT_RUNBOOK.md](PILOT_RUNBOOK.md)；任务包与 UAT 的字段定义见 [TASK_PACKET.md](TASK_PACKET.md)。
+
+## v0.3：把你本地已有的项目安全接入私有代码仓库
+
+这一步解决的是「以后不用再发 ZIP」：让代码进入一个**独立的私有代码仓库**，另一个 AI 用它的连接器就能读到确切版本。
+
+**三层必须分开**：公开工具仓库（本项目）／私有上下文仓库（记录）／**每个应用一个私有代码仓库**（代码）。本功能只把本地项目送进第三层，**不会**把业务代码写进上下文仓库。
+
+### 3 步走（先看、再批准、最后上传）
+
+```bash
+# 1) 只读体检：不会写入、不会暂存、不会删除任何东西
+python .../ach.py source-inspect --path "$HOME/Desktop/某个项目"
+
+# 2) 先在网页上建好「私有」空仓库，然后生成上传计划
+mkdir -p ~/source-onboarding/某个项目
+python .../ach.py source-plan \
+    --path "$HOME/Desktop/某个项目" --project some-project \
+    --dest git@github.com:<你>/some-project.git \
+    --workdir ~/source-onboarding/某个项目 \
+    --authorize "<你的名字>" --statement "批准：这是要上传的文件清单"
+# 它会打印一份哈希值（清单指纹）和 SOURCE_MANIFEST.txt
+
+# 3) 你看过清单后，用那个指纹批准上传
+python .../ach.py source-publish --workdir ~/source-onboarding/某个项目 \
+    --approve-manifest <上一步打印的指纹>
+
+# 4) 用全新克隆独立验证（证明远端真的有了）
+python .../ach.py source-verify --workdir ~/source-onboarding/某个项目
+
+# 5) 记录「别的工具」能不能读——不要靠猜，也不要拿本机读取成功当三方成功
+python .../ach.py source-access --workdir ~/source-onboarding/某个项目 \
+    --tool chatgpt --status pending --evidence "连接器还没指向这个仓库"
+```
+
+### 会被直接拒绝的情况（不是提醒，是拒绝）
+
+- 选中了 `.env`、密钥、证书库、数据库文件，或文件内容里有凭据特征；
+- 这些文件**曾经进过项目的 Git 历史**——因为推历史等于把它们一起公开，本工具**不会**改写历史；
+- 目标仓库**匿名可读**（那就是公开的，拒绝）；
+- 目标仓库不存在或本机没权限——会明确告诉你「需要先建私有仓库并授权」，而不是假装成功；
+- 项目已经有指向别处的 `origin`（拒绝改指向）；
+- 远端已有本地没有的提交（**拒绝强推**，也不会自动合并）；
+- 要上传的提交内容与已批准清单**不完全一致**（多一个少一个都不行）。
+
+### 压缩包 / 备份 / 超大文件
+
+默认**排除**并列出，需要你用 `--allow-review` 明确提升才会进清单。备份和导出最容易误传。
+
+### 诚实的边界
+
+- **建仓库这一步不在范围内**：需要你账号的授权，工具会报「需要先做这一步」。
+- `source-verify` 只能证明**本机**能推、能读回；**别的工具能不能读必须单独记录**。在没有第二个工具记录成功之前，汇总结论只会显示 `NOT VERIFIED`。
+- 聊天连接器目前**不支持**上传二进制（截图），走本机 CLI。
+- 全部动作都由你触发，没有后台同步。
+- 凭据检测是模式匹配，不是完整扫描；上传前请自己看一遍清单。
+

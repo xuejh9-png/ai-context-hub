@@ -87,7 +87,15 @@ configuration responsibility.
 ## Verified deployment versus roadmap
 
 - **v0.1 (shipped):** project templates, read/handoff/validate, Git sync, failure recovery and two-agent concurrency tests. In one authorized real-world pilot, WorkBuddy and Codex independently submitted private-repository handoffs; ChatGPT independently read back both records with a GitHub connector. This verifies an **on-demand artifact-sharing workflow**, not complete chat mirroring or universal read/write access across every platform.
-- **v0.2 (this change):** approved task packets with a hash-bound human approval, hash-verified image asset handoff, evidence-based completion records, the append-only UAT defect loop, and the fail-closed onboarding check. Covered by automated tests including concurrent handoff/packet publication and existing failure-recovery regressions. The v0.2 workflow has **not** yet been exercised end-to-end by a second tool on a real project.
+- **v0.2 (shipped on a branch, pending review):** approved task packets with a hash-bound human approval, hash-verified image asset handoff, evidence-based completion records, the append-only UAT defect loop, and the fail-closed onboarding check. Covered by automated tests including concurrent handoff/packet publication and existing failure-recovery regressions.
+- **v0.3 (this change):** application-source onboarding. A read-only inspection, a
+  digest-approved file manifest, a non-destructive first upload into a **separate private
+  source repository**, an independent fresh-clone read-back, and a per-tool access record. The
+  three layers (public tool, private context, private source) are now explicitly isolated, and
+  the CLI never writes application code into the context repository or tool code into a source
+  repository. Remote repository creation is deliberately out of scope: it needs account-level
+  authorization the tool does not hold, so it is reported as a setup requirement.
+
 - **Next:** run the manual 3-agent pilot, exercise a real defect round trip, and measure actual time saved and failure rates against a baseline.
 - **Longer term (only if justified):** provider-neutral packaging and better retrieval across growing project archives.
 
