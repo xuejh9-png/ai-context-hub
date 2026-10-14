@@ -101,3 +101,34 @@ remote is not accessible, **ask for access setup — never for another ZIP of th
 - New working copy must fetch latest history before reading or submitting reports.
 - Connection test success means a *real* read + write + read-back on each platform, not a file merely being visible to one agent.
 - Do not promise automatic after-chat or background posting: every write in this workflow happens while an authorized, tool-capable session is running, after a user trigger.
+
+## Onboarding an application source repository (v0.3)
+
+An existing local project becomes shareable only through this sequence. Skipping a step is
+how source leaks, so treat each gate as a requirement rather than advice.
+
+1. **Inspect read-only first.** `ach source-inspect --path <dir>` reports Git state, the
+   candidate upload set, hard denials, review items and ignored build directories. It must not
+   be replaced by "I looked at the folder".
+2. **Do not upload anything the owner has not confirmed.** The local directory, the intended
+   private repository, the file list and the first commit all need explicit owner
+   authorization. Never upload a private business project on your own initiative.
+3. **Verify private visibility; never assert it.** A `github.com` destination that answers the
+   unauthenticated API is public and must be refused. If the destination does not exist, report
+   the exact setup requirement — do not invent success and do not create a repository with
+   credentials you do not hold.
+4. **Publish exactly the approved manifest.** `source-publish` requires the digest printed by
+   `source-plan`. Never widen the selection between approval and upload; re-plan and re-approve
+   instead.
+5. **Never rewrite history or force-push.** Refuse on divergence and let the owner reconcile.
+   A project that is already a Git repository keeps its commits, branches and `origin`.
+6. **Prove the read-back.** `source-verify` must pass on a fresh clone before reporting that
+   the code is available.
+7. **Keep the three tools separate.** A successful push and read-back by WorkBuddy is not
+   evidence that ChatGPT or Codex can read the repository. Record each tool's own result with
+   `source-access`; until then the status is `NOT VERIFIED`.
+8. **Refuse without proof.** A claim that "the project is now shared" is only valid when the
+   agent read-back AND at least one independent tool read are both recorded.
+9. **Record the version in the context.** After further development, write a completion handoff
+   with source repo, branch, exact commit SHA, PR, build/run instructions, real test output and
+   `Human acceptance: PENDING`.
