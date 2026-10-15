@@ -14,10 +14,10 @@ AI Context Hub **不是一个需要部署的网站**。它是一套本地命令�
 
 ## 1. 下载工具和自己的私有仓库
 
-把 `YOUR_USERNAME` 换成自己的用户名。**这两份仓库不是同一个仓库。**
+把 `TOOL_OWNER` 换成本工具公开仓库的所有者，把 `YOUR_USERNAME` 换成你自己的 GitHub 用户名。**这两份仓库不是同一个仓库。**
 
 ```bash
-git clone https://github.com/xuejh9-png/ai-context-hub.git
+git clone https://github.com/TOOL_OWNER/ai-context-hub.git
 git clone git@github.com:YOUR_USERNAME/my-ai-context.git
 cd my-ai-context
 ```
