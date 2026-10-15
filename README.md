@@ -6,7 +6,19 @@
 
 **v0.3.0 · Git + Markdown · On-demand · Python 3.10+ · No model API required**
 
-[中文：项目背景、痛点与价值](docs/WHY_IT_EXISTS_ZH.md) · [中文部署指南](docs/DEPLOYMENT_ZH.md) · [Architecture](docs/ARCHITECTURE.md) · [Task packets & UAT](docs/TASK_PACKET.md) · [Source onboarding](docs/SOURCE_ONBOARDING.md) · [Security](docs/SECURITY.md) · [3-agent pilot runbook](docs/PILOT_RUNBOOK.md)
+**New here?** Start with the [五分钟中文上手教程](docs/QUICKSTART_ZH.md) or the [Quick start](#quick-start) below. You do **not** deploy a server, give us your API key, or send your projects to this public repository.
+
+```bash
+git clone https://github.com/xuejh9-png/ai-context-hub.git
+python ai-context-hub/src/ach.py --help
+```
+
+**Privacy in one line:** this **public** repository contains only the tool; each user's project context and application source belong in **separate private Git repositories** under their control.
+
+**Reuse status:** this repository is publicly readable, but an open-source license has **not** yet been selected. Please wait for an explicit license before treating it as licensed for redistribution or derivative distribution.
+
+
+[中文：五分钟上手](docs/QUICKSTART_ZH.md) · [中文：项目背景、痛点与价值](docs/WHY_IT_EXISTS_ZH.md) · [中文部署指南](docs/DEPLOYMENT_ZH.md) · [Architecture](docs/ARCHITECTURE.md) · [Task packets & UAT](docs/TASK_PACKET.md) · [Source onboarding](docs/SOURCE_ONBOARDING.md) · [Security](docs/SECURITY.md) · [3-agent pilot runbook](docs/PILOT_RUNBOOK.md)
 
 ## Why this project exists
 
@@ -280,4 +292,11 @@ read-back, and a per-tool access record that keeps "this machine can read it" se
 implemented and covered by tests; remote repository creation still requires the owner's
 account authorization and is reported as a setup requirement rather than assumed.
 
-License: **not yet chosen**; ask the repository owner before external redistribution or open-source licensing.
+## Community and maintenance
+
+- [Contributing](CONTRIBUTING.md): development rules, test command and privacy checklist.
+- [Report a bug](.github/ISSUE_TEMPLATE/bug_report.md): sanitized reproductions only.
+- [Security policy](SECURITY.md): report vulnerabilities privately.
+- [Publication checklist](docs/RELEASE_CHECKLIST.md): licensing, test and release gates.
+
+License: **not yet chosen**. Public visibility is not equivalent to an open-source license. The owner must approve the license before redistribution rights can be granted.
