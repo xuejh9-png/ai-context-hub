@@ -8,8 +8,10 @@
 
 **New here?** Start with the [五分钟中文上手教程](docs/QUICKSTART_ZH.md) or the [Quick start](#quick-start) below. You do **not** deploy a server, give us your API key, or send your projects to this public repository.
 
+Replace `TOOL_OWNER` with the public repository owner shown on GitHub:
+
 ```bash
-git clone https://github.com/xuejh9-png/ai-context-hub.git
+git clone https://github.com/TOOL_OWNER/ai-context-hub.git
 python ai-context-hub/src/ach.py --help
 ```
 
