@@ -6,8 +6,11 @@
 2. If working in a Git clone, run `ach read --sync` (or `git pull --ff-only`). If the pull fails, report `BLOCKED`; do not rely on stale cached text while claiming freshness.
 3. If using a ChatGPT GitHub connector, obtain the latest paths via authorized connector calls; record repository/branch/commit in handoffs when available. Do not pretend to have read a file you could not access.
 4. Treat `PROJECT_CONTEXT.md` and `DECISIONS.md` as user-aligned intent, `CURRENT_STATUS.md` as reported status, and source-code/tests as implementation evidence.
-5. Write a **new** `handoffs/<timestamp>_<agent>_<unique>.md` file with task, result, evidence, risks and next steps; do not edit handoffs created by other agents.
-6. For status/decision changes: propose a diff, seek user approval, and submit via reviewed commit or PR.
+5. **Pin the canonical decisions revision.** Record the context-repository commit SHA you actually read, and the revision of the decisions you relied on. A handoff that names no revision cannot later be cited as the basis of an "approved" decision.
+6. **Decisions have exactly one canonical home.** The private context repository holds the **published, approved** revision. A local file may be a working copy or an unpublished draft, but it cannot silently supersede the published revision. While the two disagree and nobody has approved which wins, report `STALE/CONFLICT` and treat neither as current.
+7. If the context remote is unreachable, or a known pending local conflict exists, report `STALE`/`BLOCKED` — never report "latest".
+8. Write a **new** `handoffs/<timestamp>_<agent>_<unique>.md` file with task, result, evidence, risks and next steps; do not edit handoffs created by other agents.
+9. For status/decision changes: propose a diff, seek user approval, and submit via reviewed commit or PR.
 
 ## Receiving work: read the exact packet, then decide
 
@@ -86,11 +89,54 @@ ach onboard-check --source-repo <source repo URL> [--prove-push]
 write permission. `BLOCKED` means independent review is not possible yet. If the source
 remote is not accessible, **ask for access setup — never for another ZIP of the project**.
 
+## Evidence gates and risk-based review (added for issue #9)
+
+**A specific reviewer tool is never mandatory.** Review is selected per task, by risk. The
+implementation agent is always responsible for producing reproducible evidence; a reviewer is
+an additional, optional control.
+
+### Deterministic evidence is the baseline gate
+
+1. Run the project's existing deterministic checks — tests, build, and any lint/format/static
+   check — and publish the **tested source commit SHA** together with the **actual output**.
+   Not a summary. Not "should pass".
+2. **CI not configured means `NOT VERIFIED`, never `PASS`.** A green claim requires either a
+   real CI run or a locally executed command whose output is pasted in. If the repository has
+   no CI, say `NOT VERIFIED (no CI configured)`.
+3. **Existing failing baselines are recorded, not waived.** Record the known baseline with the
+   failing test IDs (or node IDs) and the count, then compare the actual run against it. The
+   rule is "the failure set did not grow", not "the total went down". Never delete a test,
+   loosen an assertion or skip a guard to manufacture a pass.
+4. A repository that is not yet CI-ready should say so plainly. Add a workflow only when the
+   baseline is stable enough for a red/green result to carry information.
+
+### Review selection by risk
+
+| Risk | Typical change | Required controls |
+| --- | --- | --- |
+| **Routine** (reversible) | UI/text copy, small local code change, docs | Implementation agent + deterministic checks + published evidence. The human may inspect the result directly. |
+| **Medium** | A feature or data change with a contained blast radius | Deterministic checks **plus** a cross-check by a planning/verification AI when one is available, and an explicit recorded task-level decision about whether a separate reviewer is used. |
+| **High** | Auth, permissions or secret handling; database migration; production leads or financial operations; destructive Git history changes | **Independent review is required.** With no reviewer and no authorization, the task is blocked — it must not be released. |
+
+### Task states (explanatory, not a mandate for another service)
+
+- `REVIEW_REQUIRED` — high-risk task; an independent review is still outstanding.
+- `REVIEW_OPTIONAL` — a reviewer may be used if available; a recorded decision is enough either way.
+- `REVIEW_BLOCKED` — a required review cannot happen (no reviewer, no quota, no permission).
+  The work stays unreleased; the code and work records remain intact.
+- `REVIEWED` — an identified reviewer actually inspected the exact revision and its evidence.
+
+These states are written into the handoff and the task record. They do **not** require another
+cloud agent, runner, queue or model API.
+
+**Never silently bypass a required check because a reviewer's quota ran out.** Record
+`REVIEW_BLOCKED` and stop before release; a blocked release is a correct outcome, not a failure.
+
 ## Roles (defaults, not platform restrictions)
 
 - ChatGPT / planning AI: plan, clarify decisions, independently assess evidence; can read/write only through authorized tools.
-- WorkBuddy: inspect real software source code, implement approved work, report actual command outputs.
-- Codex: independent code and regression review. For a reproducible defect it adds a small regression test and publishes the repair through a PR, then hands back a usable version for human retest.
+- WorkBuddy: inspect real software source code, implement approved work, run the project's deterministic checks, report actual command outputs.
+- Codex: **one possible independent reviewer, engaged when risk or availability calls for it — not a mandatory step on every task.** When engaged, it independently checks the code and evidence, adds a small regression test for a reproducible defect, and publishes the repair through a PR for human retest.
 - User: owner of priorities, sensitive data, release permissions, approval statements and final sign-off.
 
 ## Hard constraints

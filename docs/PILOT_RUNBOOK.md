@@ -13,9 +13,22 @@ cannot afford to have an agent read.
 | Role | Default tool | Responsibility in this pilot |
 | --- | --- | --- |
 | Planning AI | ChatGPT | prepares the packet, later reads the UAT record and the completion handoff |
-| Implementation agent | WorkBuddy | reads the packet, implements in the source repository, pushes a PR, records evidence |
-| Review agent | Codex | independently checks the code and evidence, adds a regression test, publishes the repair |
+| Implementation agent | WorkBuddy | reads the packet, implements in the source repository, runs the project's deterministic checks, records evidence |
+| Review agent | **risk-selected, not fixed to one tool** | engaged only when the task's risk level calls for it (see below). When engaged it independently checks the code and evidence, adds a regression test, publishes the repair |
 | Owner | you | approves the packet, tests the build, reports the defect, accepts the result |
+
+### Decide whether a reviewer is required — before starting
+
+Record the decision and the reason. Do not change it silently mid-task.
+
+| Risk | Example | Independent reviewer |
+| --- | --- | --- |
+| Routine, reversible | copy/text, docs, a small UI tweak | **not required** — deterministic checks + published evidence + human look at the result |
+| Medium | a feature or data change with a contained blast radius | cross-check by a planning/verification AI **when one is available**; record the explicit task-level decision either way |
+| High | auth / permissions / secrets, DB migration, production leads or financial data, destructive Git history | **required** |
+
+If the chosen reviewer has no quota or no access, record `REVIEW_BLOCKED` and stop before
+release. A blocked release is a correct outcome; silently skipping the check is not.
 
 ## Prerequisites
 
